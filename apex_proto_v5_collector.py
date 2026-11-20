@@ -27,6 +27,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Dict, Any, Tuple, List, Optional
+
 import requests
 import numpy as np
 import pandas as pd
@@ -1342,7 +1343,7 @@ def _ask_gemini_batch_issues(batch_items: List[Dict[str, Any]]) -> Dict[str, Tup
         h_cands = " / ".join(it["h_cands"][:4]) if it["h_cands"] else "없음"
         a_cands = " / ".join(it["a_cands"][:4]) if it["a_cands"] else "없음"
         match_blocks.append(
-            f'[KEY: {it["cache_key"]}] {it["home"]}({h_ko}) vs {it["away"]}({a_ko})\n'
+            f'[KEY: {it["cache_key"]}] [{it.get("league", "")} | {it.get("date_str", "")}] {it["home"]}({h_ko}) vs {it["away"]}({a_ko})\n'
             f'  - 홈 후보: {h_cands}\n'
             f'  - 원정 후보: {a_cands}'
         )
@@ -1351,7 +1352,7 @@ def _ask_gemini_batch_issues(batch_items: List[Dict[str, Any]]) -> Dict[str, Tup
         "아래 축구 경기들의 최신 뉴스 후보(제목+본문요약)에서 실제 이번 경기의 부상·결장·징계·복귀·감독·예상 선발 이슈만 골라 한국어 1줄(30~75자)로 요약해줘.\n"
         "- 필수 규칙:\n"
         "  1) 반드시 '아이콘 [실제 소속팀 한글명] 핵심 내용' 형식으로 작성해. (예: 🏥 [바이에른 뮌헨] 김민재 햄스트링 부상 결장 / 👔 [바이에른 뮌헨] 콤파니 감독 한 달 만에 복귀)\n"
-        "  2) 기사에 등장하는 선수·감독이 실제로 어느 팀 소속인지 정확히 판별해 대괄호 [팀명]에 넣어. 'OO전서 복귀'처럼 상대팀 이름에 속지 말고 반드시 실제 소속팀 이름을 적어.\n"
+        "  2) 반드시 해당 경기의 두 팀(홈팀 또는 원정팀) 소속 선수·감독의 이슈만 채택해. 제3의 팀(예: 다음 주 챔스 상대인 나폴리 등) 선수·감독 소식이나 다른 대회 경기 뉴스는 무조건 버려! 대괄호 [팀명]에는 오직 이 경기의 홈팀 또는 원정팀 이름만 들어가야 해.\n"
         "  3) 이적 루머, 배당 예측, 무관한 기사는 버리고, 확인된 이슈가 없으면 '공식 발표·언론 보도 확인 시 실시간 반영됩니다.'로 적어.\n"
         "  4) 두 이슈가 같은 내용이면 중복 작성하지 말고 한쪽은 '공식 발표·언론 보도 확인 시 실시간 반영됩니다.'로 비워둬.\n"
         "  5) 반드시 아래 JSON 객체 형식으로만 답해 (키는 입력된 KEY 그대로 사용):\n"
@@ -1390,6 +1391,23 @@ def _ask_gemini_batch_issues(batch_items: List[Dict[str, Any]]) -> Dict[str, Tup
                             if isinstance(val, dict):
                                 h_s = str(val.get("home", "")).replace("|", "·").replace(",", "·").replace("\n", " ").strip()
                                 a_s = str(val.get("away", "")).replace("|", "·").replace(",", "·").replace("\n", " ").strip()
+                                h_ko_n = _to_ko_search_name(it["home"])
+                                a_ko_n = _to_ko_search_name(it["away"])
+                                def _is_valid_match_team_summary(txt: str) -> bool:
+                                    if not txt or "실시간 반영됩니다" in txt:
+                                        return True
+                                    m_tag = re.search(r"\[([^\]]+)\]", txt)
+                                    if m_tag:
+                                        tag_team = m_tag.group(1).strip()
+                                        if tag_team in ("부상/결장", "징계", "복귀", "감독", "선발", "이슈"):
+                                            return False
+                                        if not (_title_matches_team(tag_team, it["home"], h_ko_n) or _title_matches_team(tag_team, it["away"], a_ko_n)):
+                                            return False
+                                    return True
+                                if not _is_valid_match_team_summary(h_s):
+                                    h_s = "공식 발표·언론 보도 확인 시 실시간 반영됩니다."
+                                if not _is_valid_match_team_summary(a_s):
+                                    a_s = "공식 발표·언론 보도 확인 시 실시간 반영됩니다."
                                 if h_s and a_s and h_s == a_s and "공식 발표·언론 보도 확인 시 실시간 반영됩니다." not in h_s:
                                     h_ko_n = _to_ko_search_name(it["home"])
                                     a_ko_n = _to_ko_search_name(it["away"])
@@ -1449,7 +1467,8 @@ def _collect_rss_candidates(team_name: str) -> Tuple[List[str], str]:
                     if not raw_t or not _title_matches_team(raw_t, key, ko_name):
                         continue
                     # 'OO전', 'OO전서', 'OO 상대로', 'against OO', 'face OO'처럼 상대팀으로만 언급된 기사 차단
-                    if re.search(rf"{re.escape(ko_name)}(전|전서|전에|전의|과의| 상대로)", raw_t) and not re.search(rf"{re.escape(ko_name)}\s*(감독|선수|수비수|공격수|미드필더|골키퍼|주전|구단|측|은|는|이|가|의)", raw_t):
+                    short_ko = ko_name.replace("맨체스터 시티", "맨시티").replace("맨체스터 Utd", "맨유").replace("바이에른 뮌헨", "뮌헨")
+                    if re.search(rf"({re.escape(ko_name)}|{re.escape(short_ko)})(전|전서|전에|전의|과의| 상대로)", raw_t) and not re.search(rf"{re.escape(ko_name)}\s*(감독|선수|수비수|공격수|미드필더|골키퍼|주전|구단|측|은|는|이|가|의)", raw_t):
                         continue
                     if re.search(rf"(against|face|facing|vs\.?|clash with|trip to)\s+{re.escape(key.lower())}", raw_t.lower()):
                         continue
@@ -1594,7 +1613,7 @@ def run_team_issue_sync() -> int:
 
         h_cands, h_url = rss_by_team.get(home_team, ([], ""))
         a_cands, a_url = rss_by_team.get(away_team, ([], ""))
-        rss_sig = "v4|" + "|".join(h_cands + a_cands)
+        rss_sig = "v5|" + "|".join(h_cands + a_cands)
 
         cache_key = f"{home_team}__{away_team}__{kdt.strftime('%Y%m%d') if kdt else 'na'}"
         cached_entry = ai_cache.get(cache_key)
@@ -1614,6 +1633,8 @@ def run_team_issue_sync() -> int:
             elif h_cands or a_cands:
                 gemini_todo.append({
                     "cache_key": cache_key,
+                    "league": league,
+                    "date_str": kdt.strftime("%Y-%m-%d") if kdt else "",
                     "home": home_team,
                     "away": away_team,
                     "h_cands": h_cands,
