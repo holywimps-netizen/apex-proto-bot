@@ -1519,7 +1519,36 @@ def _ask_gemini_grounded_match_issue(item: Dict[str, Any]) -> Tuple[str, str, bo
                 print(f"  ⚠️ [{model_id} 그라운딩 400] 다음 모델 시도")
                 continue
             elif resp.status_code == 429:
-                print(f"  ⏭️ [{model_id}] 한도 도달 -> 다음 모델로 즉시 전환!")
+                err_snippet = (resp.text or "").replace("\n", " ")[:180]
+                is_rpm = any(k in err_snippet.lower() for k in ("per_minute", "minute", "rate limit", "rpm"))
+                if is_rpm:
+                    print(f"  ⏳ [{model_id}] 분당 호출 속도 제한 -> 6초 대기 후 1회 재시도 ({err_snippet})")
+                    time.sleep(6.0)
+                    resp2 = requests.post(endpoint, json=payload, timeout=30)
+                    if resp2.status_code == 200:
+                        resp = resp2
+                        data = resp.json()
+                        cands = data.get("candidates", [])
+                        if cands:
+                            parts = cands[0].get("content", {}).get("parts", [])
+                            raw_txt = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+                            g_urls = _extract_grounding_urls(cands[0])
+                            m_json = re.search(r"\{.*\}", raw_txt, re.S)
+                            if m_json:
+                                parsed = json.loads(m_json.group(0))
+                                h_s = str(parsed.get("home", "")).replace("|", "·").replace("\n", " ").strip()
+                                a_s = str(parsed.get("away", "")).replace("|", "·").replace("\n", " ").strip()
+                                if h_s and "[URL:" not in h_s:
+                                    hu = _pick_team_grounding_url(g_urls, home_en, h_ko)
+                                    if hu:
+                                        h_s = f"{h_s} [URL:{hu}]"
+                                if a_s and "[URL:" not in a_s:
+                                    au = _pick_team_grounding_url(g_urls, away_en, a_ko)
+                                    if au:
+                                        a_s = f"{a_s} [URL:{au}]"
+                                print(f"  🔎 [{model_id} 재시도 성공:{stage}] {h_ko} vs {a_ko}")
+                                return h_s, a_s, True
+                print(f"  ⏭️ [{model_id}] 429 한도 도달 ({err_snippet}) -> 다음 모델 전환")
                 _EXHAUSTED_GEMINI_MODELS.add(model_id)
                 continue
             elif resp.status_code == 404:
@@ -1853,7 +1882,13 @@ def run_team_issue_sync() -> int:
     # 2단계-A: 유료 구글 검색 그라운딩 병렬 실행 (신규/단계전환 경기만 1회 호출)
     batch_results: Dict[str, Tuple[str, str]] = {}
     if use_grounding_now and grounding_todo:
-        print(f"▶ [그라운딩 검색] 캐시 미적중 {len(grounding_todo)}경기만 Gemini 검색 실행...")
+        # 킥오프가 가장 임박한 경기부터 우선 처리하고, 1회 실행당 최대 15경기로 속도 조절 (RPM 429 폭주 방지)
+        grounding_todo.sort(key=lambda x: x.get("hrs_to_ko", 999.0))
+        if len(grounding_todo) > 15:
+            print(f"▶ [그라운딩 검색] 미적중 {len(grounding_todo)}경기 중 임박 15경기 우선 실행 (나머지는 다음 30분 주기에 자동 이어서 처리)")
+            grounding_todo = grounding_todo[:15]
+        else:
+            print(f"▶ [그라운딩 검색] 캐시 미적중 {len(grounding_todo)}경기만 Gemini 검색 실행...")
         # 첫 경기로 그라운딩 키 권한 사전 확인 (무료 키면 즉시 RSS 폴백)
         first_it = grounding_todo[0]
         fh, fa, ok_first = _ask_gemini_grounded_match_issue(first_it)
@@ -1870,8 +1905,11 @@ def run_team_issue_sync() -> int:
                 ai_cache_dirty = True
             rest_todo = grounding_todo[1:]
             if rest_todo:
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    fut_map = {pool.submit(_ask_gemini_grounded_match_issue, it): it for it in rest_todo}
+                def _paced_grounding(it_arg):
+                    time.sleep(0.8)
+                    return _ask_gemini_grounded_match_issue(it_arg)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_map = {pool.submit(_paced_grounding, it): it for it in rest_todo}
                     for fut, it in fut_map.items():
                         try:
                             gh, ga, ok = fut.result(timeout=40)
