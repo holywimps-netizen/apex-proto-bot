@@ -47,8 +47,8 @@ MAIN_SHEET_NAME = "Untitled"           # 메인 분석 시트 탭 이름
 MAPPING_SHEET_NAME = "팀명_매핑사전"     # 사이트별 팀명 표준화 탭 이름
 SERVICE_ACCOUNT_FILE = "service_account.json"  # 구글 클라우드 서비스 계정 JSON 키 경로
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()  # ★ Google AI Studio에서 발급받은 Gemini API 키를 여기에 입력하세요!
-GEMINI_MODEL_CHAIN = ["gemini-4-hydrogen", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash-lite"]
-USE_GOOGLE_SEARCH_GROUNDING = False  # True는 유료 결제 연결 시 사용, False면 완전 무료 티어로 RSS 기사 정밀 AI 요약
+GEMINI_MODEL_CHAIN = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash-lite"]
+USE_GOOGLE_SEARCH_GROUNDING = True  # 유료 Tier 1 + 구글 검색 그라운딩 (미지원 키일 경우 무료 RSS AI 요약으로 자동 폴백)
 AI_ISSUE_CACHE_FILE = "team_issue_ai_cache.json"
 
 DRY_RUN = False                        # True 설정 시 시트에 쓰지 않고 콘솔에만 출력
@@ -1277,19 +1277,32 @@ def _team_rest_note(stats: Dict[str, Any]) -> str:
     return ""
 
 
-def _build_quant_tactical_issue(home_team: str, away_team: str, h_stats: Dict[str, Any], a_stats: Dict[str, Any], h_ext: str, a_ext: str) -> str:
+def _build_quant_tactical_issue(
+    home_team: str,
+    away_team: str,
+    h_stats: Dict[str, Any],
+    a_stats: Dict[str, Any],
+    h_ext: str,
+    a_ext: str,
+    hours_to_ko: Optional[float] = None,
+) -> str:
     """실시간 외부 부상·결장·뉴스 + 1시간 전 선발확정 + 단기 휴식(<72h) 결합해 AP열 텍스트 생성"""
     h_rest_note = _team_rest_note(h_stats)
     a_rest_note = _team_rest_note(a_stats)
+    empty_fallback = (
+        "경기 시작 2일 전부터 실시간 반영됩니다."
+        if (hours_to_ko is not None and hours_to_ko > 24.0)
+        else "공식 발표, 언론 보도 확인 시 실시간 반영됩니다."
+    )
 
     if not h_ext:
-        h_ext = h_rest_note if h_rest_note else "공식 발표·언론 보도 확인 시 실시간 반영됩니다."
-    elif h_rest_note:
+        h_ext = h_rest_note if h_rest_note else empty_fallback
+    elif h_rest_note and "단기 휴식" not in h_ext:
         h_ext = f"{h_ext} / {h_rest_note}"
 
     if not a_ext:
-        a_ext = a_rest_note if a_rest_note else "공식 발표·언론 보도 확인 시 실시간 반영됩니다."
-    elif a_rest_note:
+        a_ext = a_rest_note if a_rest_note else empty_fallback
+    elif a_rest_note and "단기 휴식" not in a_ext:
         a_ext = f"{a_ext} / {a_rest_note}"
 
     return f"홈: {h_ext} || 원정: {a_ext}"
@@ -1314,17 +1327,178 @@ def _save_ai_issue_cache(cache_data: Dict[str, Any]) -> None:
 
 
 def _get_issue_stage(kdt: Optional[datetime], now: datetime) -> str:
+    """
+    경기 시작 잔여 시간 기준 3단계 캐시 구간 반환:
+      - > 48h : "wait" (AI 검색 안 함 -> '경기 시작 2일 전부터 실시간 반영됩니다.')
+      - 24h ~ 48h : "48h" (2일 전 1회 검색)
+      - 5h ~ 24h  : "24h" (1일 전 1회 검색)
+      - <= 5h     : "5h"  (당일 5시간 전 최종 1회 검색; 1시간 전 공식 선발은 ESPN 무료 자동 합류)
+    """
     if not kdt:
-        return "3d"
+        return "24h"
     hrs = (kdt - now).total_seconds() / 3600.0
-    if hrs <= 2.0:
-        return "1h"
+    if hrs > 48.0:
+        return "wait"
+    if hrs <= 5.0:
+        return "5h"
     if hrs <= 24.0:
-        return "1d"
-    return "3d"
+        return "24h"
+    return "48h"
 
 
 _EXHAUSTED_GEMINI_MODELS = set()
+_GROUNDING_DISABLED = False
+
+
+def _extract_grounding_urls(candidate: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """groundingMetadata에서 실제 검색된 원문 (title, uri) 목록 추출"""
+    meta = candidate.get("groundingMetadata") or {}
+    chunks = meta.get("groundingChunks") or []
+    urls: List[Tuple[str, str]] = []
+    for ch in chunks:
+        if not isinstance(ch, dict):
+            continue
+        web = ch.get("web") or {}
+        uri = str(web.get("uri") or "").strip()
+        title = str(web.get("title") or "").strip()
+        if uri.startswith("http"):
+            urls.append((title, uri))
+    return urls
+
+
+def _pick_team_grounding_url(urls: List[Tuple[str, str]], team_en: str, team_ko: str) -> str:
+    if not urls:
+        return ""
+    en_low = team_en.lower()
+    en_tokens = [w for w in re.split(r"[^a-z0-9]+", en_low) if len(w) >= 4 and w not in ("club", "city", "united", "real", "sport")]
+    for title, uri in urls:
+        tl = title.lower()
+        if (team_ko and team_ko in title) or en_low in tl or any(tok in tl for tok in en_tokens):
+            return uri
+    return urls[0][1]
+
+
+def _ask_gemini_grounded_match_issue(item: Dict[str, Any]) -> Tuple[str, str, bool]:
+    """
+    유료 Tier 1 Google Search Grounding으로 단일 경기(홈/원정)의 최신 기사 본문을 직접 검색해
+    실제 선수명·부상·징계·복귀·예상 선발·감독 변수만 똑똑하게 핵심 요약.
+    반환: (home_summary, away_summary, succeeded)
+    """
+    global _GROUNDING_DISABLED
+    api_key = GEMINI_API_KEY.strip()
+    if not api_key or _GROUNDING_DISABLED:
+        return "", "", False
+
+    home_en = item["home"]
+    away_en = item["away"]
+    h_ko = _to_ko_search_name(home_en)
+    a_ko = _to_ko_search_name(away_en)
+    league = item.get("league", "")
+    date_str = item.get("date_str", "")
+    stage = item.get("stage", "24h")
+    stage_hint = (
+        "경기 시작 5시간 이내 최종 직전 점검 단계입니다. 최신 기자회견, 최종 부상자 명단, 유력 선발 라인업 변화를 집중 확인하세요."
+        if stage == "5h"
+        else "최신 팀 뉴스, 감독 기자회견, 부상·징계 결장자, 복귀 선수, 예상 선발 핵심 변화를 확인하세요."
+    )
+
+    prompt = (
+        f"축구 경기 [{league} | {date_str}] {home_en}({h_ko}) vs {away_en}({a_ko})의 최신 팀 뉴스를 구글 검색으로 조사해, "
+        f"승부 판단에 실제로 영향을 주는 핵심 정보만 팀별로 한국어 1줄씩 요약해줘.\n"
+        f"- 시점: {stage_hint}\n"
+        "- 핵심 요약 우선순위 (중요도 순):\n"
+        "  1) 핵심 주전 확정 결장·부상·징계 (반드시 구체적인 선수 한글명과 부상 부위/징계 사유 명시)\n"
+        "  2) 주전 선수 부상 복귀·출전 불투명(의심) 여부 및 예상 선발 핵심 변화\n"
+        "  3) 감독 기자회견 핵심 변수(로테이션 예고, 전술 변화 등)\n"
+        "- 절대 금지 규칙:\n"
+        "  1) '예상 라인업 및 부상 최신', '팀 뉴스 확인' 같은 껍데기 기사 제목만 적지 마. 반드시 본문 속 실제 선수 이름과 상태를 적어.\n"
+        "  2) 제3의 팀(다른 경기·다음 주 챔스 상대팀 등) 소식, 이적 루머, 배당/승부 예측, 과거 경기 리뷰는 100% 버려.\n"
+        "  3) 반드시 '아이콘 [팀 한글명] 핵심 내용' 형식으로 작성해 (팀당 40~110자).\n"
+        "     예시: 🏥 [맨체스터 시티] 로드리(무릎)·코바치치 결장 확정, 포든 훈련 복귀로 선발 유력\n"
+        "     예시: 🔄 [풀럼] 안데르센 경고 누적 결장, 히메네스 컨디션 회복으로 최전방 선발 예상\n"
+        "  4) 구체적으로 확인된 선수·감독 이슈가 없는 팀은 억지로 지어내지 말고 반드시 빈 문자열(\"\")로 비워둬.\n"
+        "- 출력 형식: 다른 설명 없이 오직 아래 JSON 객체만 출력해.\n"
+        '{"home": "홈팀 1줄 요약 또는 빈 문자열", "away": "원정팀 1줄 요약 또는 빈 문자열"}'
+    )
+
+    for model_id in GEMINI_MODEL_CHAIN:
+        if model_id in _EXHAUSTED_GEMINI_MODELS:
+            continue
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+        }
+        try:
+            resp = requests.post(endpoint, json=payload, timeout=30)
+            if resp.status_code == 200:
+                data = resp.json()
+                cands = data.get("candidates", [])
+                if not cands:
+                    return "", "", True
+                parts = cands[0].get("content", {}).get("parts", [])
+                raw_txt = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+                g_urls = _extract_grounding_urls(cands[0])
+                m_json = re.search(r"\{.*\}", raw_txt, re.S)
+                if not m_json:
+                    return "", "", True
+                parsed = json.loads(m_json.group(0))
+                h_s = str(parsed.get("home", "")).replace("|", "·").replace("\n", " ").strip()
+                a_s = str(parsed.get("away", "")).replace("|", "·").replace("\n", " ").strip()
+
+                def _clean_grounded_line(txt: str, target_en: str, target_ko: str, other_en: str, other_ko: str) -> str:
+                    if not txt or "실시간 반영됩니다" in txt or "확인된 이슈 없" in txt or "특이 사항 없" in txt:
+                        return ""
+                    if re.search(r"(예상 라인업 및 부상 최신|팀 뉴스 확인|부상 업데이트 확인)$", txt):
+                        return ""
+                    m_tag = re.search(r"\[([^\]]+)\]", txt)
+                    if m_tag:
+                        tag_team = m_tag.group(1).strip()
+                        if tag_team in ("부상/결장", "징계", "복귀", "감독", "선발", "이슈"):
+                            txt = re.sub(r"\[[^\]]+\]", f"[{target_ko}]", txt, count=1)
+                        elif not (_title_matches_team(tag_team, target_en, target_ko) or _title_matches_team(tag_team, other_en, other_ko)):
+                            return ""
+                    return txt
+
+                h_s = _clean_grounded_line(h_s, home_en, h_ko, away_en, a_ko)
+                a_s = _clean_grounded_line(a_s, away_en, a_ko, home_en, h_ko)
+                if h_s and a_s and h_s == a_s:
+                    a_s = ""
+
+                if h_s and "[URL:" not in h_s:
+                    hu = _pick_team_grounding_url(g_urls, home_en, h_ko)
+                    if hu:
+                        h_s = f"{h_s} [URL:{hu}]"
+                if a_s and "[URL:" not in a_s:
+                    au = _pick_team_grounding_url(g_urls, away_en, a_ko)
+                    if au:
+                        a_s = f"{a_s} [URL:{au}]"
+
+                print(f"  🔎 [{model_id} 그라운딩:{stage}] {h_ko} vs {a_ko} -> 홈:{'O' if h_s else '-'} / 원정:{'O' if a_s else '-'}")
+                return h_s, a_s, True
+            elif resp.status_code in (400, 403):
+                err_txt = (resp.text or "").lower()
+                if "search" in err_txt or "grounding" in err_txt or "billing" in err_txt or "permission" in err_txt or resp.status_code == 403:
+                    print(f"  ℹ️ [{model_id} 그라운딩 미지원/권한 오류 {resp.status_code}] 무료 RSS AI 요약 모드로 자동 전환합니다.")
+                    _GROUNDING_DISABLED = True
+                    return "", "", False
+                print(f"  ⚠️ [{model_id} 그라운딩 400] 다음 모델 시도")
+                continue
+            elif resp.status_code == 429:
+                print(f"  ⏭️ [{model_id}] 한도 도달 -> 다음 모델로 즉시 전환!")
+                _EXHAUSTED_GEMINI_MODELS.add(model_id)
+                continue
+            elif resp.status_code == 404:
+                _EXHAUSTED_GEMINI_MODELS.add(model_id)
+                continue
+            else:
+                print(f"  ⚠️ [{model_id} 그라운딩 응답 {resp.status_code}] 다음 모델 시도")
+                continue
+        except Exception as e:
+            print(f"  ⚠️ [{model_id} 그라운딩 통신 지연] {e}")
+            continue
+    return "", "", False
 
 
 def _ask_gemini_batch_issues(batch_items: List[Dict[str, Any]]) -> Dict[str, Tuple[str, str]]:
@@ -1538,7 +1712,7 @@ def run_team_issue_sync() -> int:
             continue
 
         slug = _get_espn_slug(league)
-        if kdt and slug and abs((kdt - now).total_seconds()) <= 72 * 3600:
+        if kdt and slug and abs((kdt - now).total_seconds()) <= 48 * 3600:
             needed_slugs_dates.add((slug, kdt.strftime("%Y%m%d")))
             needed_slugs_dates.add((slug, (kdt - timedelta(days=1)).strftime("%Y%m%d")))
 
@@ -1571,36 +1745,29 @@ def run_team_issue_sync() -> int:
     ai_cache_dirty = False
     now_ts = time.time()
 
-    # 1단계: 3일 초과 대기 처리 & 3일 이내 경기의 ESPN + RSS 후보 병렬 초고속 수집
+    # 1단계: 2일(48시간) 초과 대기 처리 & 48시간 이내 경기 필터링
     active_items: List[Dict[str, Any]] = []
-    gemini_todo: List[Dict[str, Any]] = []
-    within_3d_rows = []
+    grounding_todo: List[Dict[str, Any]] = []
+    rss_fallback_rows: List[Dict[str, Any]] = []
+    within_48h_rows = []
 
     for idx, league, home_team, away_team, slug, curr_ap, kdt in upcoming_rows:
-        if kdt and (kdt - now).total_seconds() > 72 * 3600:
-            wait_msg = "경기 시작 3일 전부터 실시간 반영됩니다."
+        hrs_to_ko = (kdt - now).total_seconds() / 3600.0 if kdt else 24.0
+        if kdt and hrs_to_ko > 48.0:
+            wait_msg = "경기 시작 2일 전부터 실시간 반영됩니다."
             if curr_ap != wait_msg:
                 batch_updates.append({"range": f"AP{idx}", "values": [[wait_msg]]})
                 updated_issues += 1
             continue
         if curr_ap and "선발확정:" in curr_ap and "FIFA" not in curr_ap and "PPDA" not in curr_ap:
             continue
-        within_3d_rows.append((idx, league, home_team, away_team, slug, curr_ap, kdt))
+        within_48h_rows.append((idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko))
 
-    print(f"▶ [팀 이슈 수집] 3일 이내 대상 {len(within_3d_rows)}경기 최신 뉴스 병렬 조회 중...")
-    unique_teams = sorted({t for (_, _, h, a, _, _, _) in within_3d_rows for t in (h, a) if t})
-    rss_by_team: Dict[str, Tuple[List[str], str]] = {}
-    if unique_teams:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futs = {t: pool.submit(_collect_rss_candidates, t) for t in unique_teams}
-            for t, fut in futs.items():
-                try:
-                    rss_by_team[t] = fut.result(timeout=12)
-                except Exception:
-                    rss_by_team[t] = ([], "")
-    print(f"▶ [팀 이슈 수집] {len(unique_teams)}개 팀 뉴스 수집 완료 -> Gemini 배치 요약 시작...")
+    use_grounding_now = bool(USE_GOOGLE_SEARCH_GROUNDING and GEMINI_API_KEY.strip() and not _GROUNDING_DISABLED)
+    print(f"▶ [팀 이슈 수집] 48시간 이내 대상 {len(within_48h_rows)}경기 점검 중... (모드: {'구글검색 그라운딩 3단계 캐시' if use_grounding_now else '무료 RSS 요약'})")
 
-    for idx, league, home_team, away_team, slug, curr_ap, kdt in within_3d_rows:
+    # 1-a: ESPN 무료 공식 라인업/부상 조회 + 단계별 캐시 확인 (48h / 24h / 5h)
+    for idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko in within_48h_rows:
         h_ext, a_ext = "", ""
         matched_eid = ""
         for (s_key, hn, an), eid in espn_event_map.items():
@@ -1611,74 +1778,145 @@ def run_team_issue_sync() -> int:
         if matched_eid:
             h_ext, a_ext = _extract_espn_event_issues(slug, matched_eid, home_team, away_team)
 
-        h_cands, h_url = rss_by_team.get(home_team, ([], ""))
-        a_cands, a_url = rss_by_team.get(away_team, ([], ""))
-        rss_sig = "v5|" + "|".join(h_cands + a_cands)
-
+        stage = _get_issue_stage(kdt, now)
         cache_key = f"{home_team}__{away_team}__{kdt.strftime('%Y%m%d') if kdt else 'na'}"
         cached_entry = ai_cache.get(cache_key)
         ai_h, ai_a = "", ""
 
-        cache_valid = (
-            cached_entry
-            and cached_entry.get("sig") == rss_sig
-            and (now_ts - float(cached_entry.get("ts", 0))) < 10800
-            and curr_ap
-            and "3일 전부터" not in curr_ap
-        )
-        if GEMINI_API_KEY.strip():
-            if cache_valid:
-                ai_h = cached_entry.get("home", "")
-                ai_a = cached_entry.get("away", "")
-            elif h_cands or a_cands:
-                gemini_todo.append({
-                    "cache_key": cache_key,
-                    "league": league,
-                    "date_str": kdt.strftime("%Y-%m-%d") if kdt else "",
-                    "home": home_team,
-                    "away": away_team,
-                    "h_cands": h_cands,
-                    "a_cands": a_cands,
-                    "h_url": h_url,
-                    "a_url": a_url,
-                    "rss_sig": rss_sig,
-                })
-
-        active_items.append({
+        item_obj = {
             "idx": idx,
             "league": league,
+            "date_str": kdt.strftime("%Y-%m-%d") if kdt else "",
             "home": home_team,
             "away": away_team,
             "kdt": kdt,
+            "hrs_to_ko": hrs_to_ko,
+            "stage": stage,
             "curr_ap": curr_ap,
             "h_ext": h_ext,
             "a_ext": a_ext,
             "ai_h": ai_h,
             "ai_a": ai_a,
             "cache_key": cache_key,
-        })
+        }
 
-    # 2단계: Gemini 미캐시 경기를 8경기씩 묶어서 호출 (무료 한도 초과 방지)
+        if use_grounding_now:
+            # 이미 동일 단계(48h/24h/5h)에서 그라운딩 완료된 경기는 캐시 재사용 (중복 과금 0원!)
+            has_stage_cache = (
+                isinstance(cached_entry, dict)
+                and cached_entry.get("ver") == "v6_grounding"
+                and cached_entry.get("stage") == stage
+            )
+            if has_stage_cache:
+                item_obj["ai_h"] = cached_entry.get("home", "")
+                item_obj["ai_a"] = cached_entry.get("away", "")
+            elif "선발확정:" not in h_ext or "선발확정:" not in a_ext:
+                grounding_todo.append(item_obj)
+        else:
+            rss_fallback_rows.append(item_obj)
+
+        active_items.append(item_obj)
+
+    # 2단계-A: 유료 구글 검색 그라운딩 병렬 실행 (신규/단계전환 경기만 1회 호출)
     batch_results: Dict[str, Tuple[str, str]] = {}
-    if GEMINI_API_KEY.strip() and gemini_todo:
-        for b_i in range(0, len(gemini_todo), 15):
-            chunk = gemini_todo[b_i:b_i + 15]
-            res_map = _ask_gemini_batch_issues(chunk)
-            for it in chunk:
-                ck = it["cache_key"]
-                if ck in res_map:
-                    gh, ga = res_map[ck]
-                    if gh and it["h_url"] and "실시간 반영" not in gh and "특이 결장" not in gh and "[URL:" not in gh:
-                        gh = f"{gh} [URL:{it['h_url']}]"
-                    if ga and it["a_url"] and "실시간 반영" not in ga and "특이 결장" not in ga and "[URL:" not in ga:
-                        ga = f"{ga} [URL:{it['a_url']}]"
-                    batch_results[ck] = (gh, ga)
-                    ai_cache[ck] = {"sig": it["rss_sig"], "ts": now_ts, "home": gh, "away": ga}
-                    ai_cache_dirty = True
-            if b_i + 15 < len(gemini_todo):
-                time.sleep(2.5)
+    if use_grounding_now and grounding_todo:
+        print(f"▶ [그라운딩 검색] 캐시 미적중 {len(grounding_todo)}경기만 Gemini 검색 실행...")
+        # 첫 경기로 그라운딩 키 권한 사전 확인 (무료 키면 즉시 RSS 폴백)
+        first_it = grounding_todo[0]
+        fh, fa, ok_first = _ask_gemini_grounded_match_issue(first_it)
+        if ok_first:
+            batch_results[first_it["cache_key"]] = (fh, fa)
+            ai_cache[first_it["cache_key"]] = {
+                "ver": "v6_grounding",
+                "stage": first_it["stage"],
+                "ts": now_ts,
+                "home": fh,
+                "away": fa,
+            }
+            ai_cache_dirty = True
+            rest_todo = grounding_todo[1:]
+            if rest_todo:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    fut_map = {pool.submit(_ask_gemini_grounded_match_issue, it): it for it in rest_todo}
+                    for fut, it in fut_map.items():
+                        try:
+                            gh, ga, ok = fut.result(timeout=40)
+                            if ok:
+                                batch_results[it["cache_key"]] = (gh, ga)
+                                ai_cache[it["cache_key"]] = {
+                                    "ver": "v6_grounding",
+                                    "stage": it["stage"],
+                                    "ts": now_ts,
+                                    "home": gh,
+                                    "away": ga,
+                                }
+                                ai_cache_dirty = True
+                        except Exception:
+                            pass
+        else:
+            # 그라운딩 미지원 키이거나 일시 오류 -> 무료 RSS 배치 요약으로 자동 폴백
+            rss_fallback_rows.extend(grounding_todo)
 
-    # 3단계: 최종 브리핑 조립 및 시트 기록
+    # 2단계-B: 무료 RSS 폴백 (그라운딩 비활성/미지원 시에만 작동)
+    if rss_fallback_rows:
+        unique_teams = sorted({t for it in rss_fallback_rows for t in (it["home"], it["away"]) if t})
+        rss_by_team: Dict[str, Tuple[List[str], str]] = {}
+        if unique_teams:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futs = {t: pool.submit(_collect_rss_candidates, t) for t in unique_teams}
+                for t, fut in futs.items():
+                    try:
+                        rss_by_team[t] = fut.result(timeout=12)
+                    except Exception:
+                        rss_by_team[t] = ([], "")
+        gemini_todo: List[Dict[str, Any]] = []
+        for it in rss_fallback_rows:
+            h_cands, h_url = rss_by_team.get(it["home"], ([], ""))
+            a_cands, a_url = rss_by_team.get(it["away"], ([], ""))
+            rss_sig = "v5|" + "|".join(h_cands + a_cands)
+            cached_entry = ai_cache.get(it["cache_key"])
+            cache_valid = (
+                isinstance(cached_entry, dict)
+                and cached_entry.get("sig") == rss_sig
+                and (now_ts - float(cached_entry.get("ts", 0))) < 10800
+                and it["curr_ap"]
+                and "전부터 실시간 반영됩니다" not in it["curr_ap"]
+            )
+            if GEMINI_API_KEY.strip():
+                if cache_valid:
+                    batch_results[it["cache_key"]] = (cached_entry.get("home", ""), cached_entry.get("away", ""))
+                elif h_cands or a_cands:
+                    gemini_todo.append({
+                        "cache_key": it["cache_key"],
+                        "league": it["league"],
+                        "date_str": it["date_str"],
+                        "home": it["home"],
+                        "away": it["away"],
+                        "h_cands": h_cands,
+                        "a_cands": a_cands,
+                        "h_url": h_url,
+                        "a_url": a_url,
+                        "rss_sig": rss_sig,
+                    })
+        if GEMINI_API_KEY.strip() and gemini_todo:
+            for b_i in range(0, len(gemini_todo), 15):
+                chunk = gemini_todo[b_i:b_i + 15]
+                res_map = _ask_gemini_batch_issues(chunk)
+                for it in chunk:
+                    ck = it["cache_key"]
+                    if ck in res_map:
+                        gh, ga = res_map[ck]
+                        if gh and it["h_url"] and "실시간 반영" not in gh and "특이 결장" not in gh and "[URL:" not in gh:
+                            gh = f"{gh} [URL:{it['h_url']}]"
+                        if ga and it["a_url"] and "실시간 반영" not in ga and "특이 결장" not in ga and "[URL:" not in ga:
+                            ga = f"{ga} [URL:{it['a_url']}]"
+                        batch_results[ck] = (gh, ga)
+                        ai_cache[ck] = {"sig": it["rss_sig"], "ts": now_ts, "home": gh, "away": ga}
+                        ai_cache_dirty = True
+                if b_i + 15 < len(gemini_todo):
+                    time.sleep(2.5)
+
+    # 3단계: 최종 브리핑 조립 및 시트 기록 (ESPN 1시간 전 공식 선발 + AI 핵심 요약 + 단기 휴식)
     for item in active_items:
         h_ext = item["h_ext"]
         a_ext = item["a_ext"]
@@ -1689,21 +1927,25 @@ def run_team_issue_sync() -> int:
         if ai_a and "결장/부상:" not in a_ext:
             a_ext = f"{a_ext} / {ai_a}" if a_ext else ai_a
 
-        if "결장/부상:" not in h_ext and not ai_h:
-            h_news = _fetch_google_news_team_issue(item["home"], news_cache)
-            if h_news:
-                h_ext = f"{h_ext} / {h_news}" if h_ext else h_news
-        if "결장/부상:" not in a_ext and not ai_a:
-            a_news = _fetch_google_news_team_issue(item["away"], news_cache)
-            if a_news:
-                a_ext = f"{a_ext} / {a_news}" if a_ext else a_news
+        # 그라운딩이 비활성화된 경우에만 무료 RSS 단순 제목 폴백 허용
+        if not use_grounding_now or _GROUNDING_DISABLED:
+            if "결장/부상:" not in h_ext and not ai_h:
+                h_news = _fetch_google_news_team_issue(item["home"], news_cache)
+                if h_news:
+                    h_ext = f"{h_ext} / {h_news}" if h_ext else h_news
+            if "결장/부상:" not in a_ext and not ai_a:
+                a_news = _fetch_google_news_team_issue(item["away"], news_cache)
+                if a_news:
+                    a_ext = f"{a_ext} / {a_news}" if a_ext else a_news
 
         h_stats = lookup_club_master(item["home"], elo_dict)
         a_stats = lookup_club_master(item["away"], elo_dict)
         is_am = any(k in item["league"].lower() for k in ("nations", "world cup", "qual", "euro", "asian", "copa", "friendly", "international"))
         h_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["home"], item["kdt"], club_history_issues)
         a_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["away"], item["kdt"], club_history_issues)
-        issue_text = _build_quant_tactical_issue(item["home"], item["away"], h_stats, a_stats, h_ext, a_ext)
+        issue_text = _build_quant_tactical_issue(
+            item["home"], item["away"], h_stats, a_stats, h_ext, a_ext, hours_to_ko=item["hrs_to_ko"]
+        )
 
         if issue_text and issue_text != item["curr_ap"]:
             batch_updates.append({"range": f"AP{item['idx']}", "values": [[issue_text]]})
