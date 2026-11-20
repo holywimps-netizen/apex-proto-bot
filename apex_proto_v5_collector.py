@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
 import requests
@@ -50,6 +50,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()  # ★ Google AI S
 GEMINI_MODEL_CHAIN = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash-lite"]
 USE_GOOGLE_SEARCH_GROUNDING = True  # 유료 Tier 1 + 구글 검색 그라운딩 (미지원 키일 경우 무료 RSS AI 요약으로 자동 폴백)
 AI_ISSUE_CACHE_FILE = "team_issue_ai_cache.json"
+KST_TZ = timezone(timedelta(hours=9))
+
+
+def _now_kst() -> datetime:
+    """GitHub Actions(UTC)나 국내 PC 어디서 실행해도 항상 정확한 한국 표준시(KST, naive) 반환"""
+    return datetime.now(KST_TZ).replace(tzinfo=None)
 
 DRY_RUN = False                        # True 설정 시 시트에 쓰지 않고 콘솔에만 출력
 SCORE_INTERVAL_SEC = 30               # 5분(300초)마다 무료 실시간/종료 스코어 스캔
@@ -331,7 +337,7 @@ def lookup_club_master(team_name: str, elo_dict: Dict[str, float]) -> Dict[str, 
 
 
 def fetch_club_elo_map() -> Dict[str, float]:
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = _now_kst().strftime("%Y-%m-%d")
     url = f"http://api.clubelo.com/{today_str}"
     elo_map: Dict[str, float] = {}
     try:
@@ -534,7 +540,7 @@ def _build_club_schedule_history(all_values: List[List[str]]) -> Dict[str, List[
 
     # 2) ESPN 최근 10일 유럽 5대리그 + UCL 일정 수집
     club_slugs = ("eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "uefa.champions")
-    now_dt = datetime.now()
+    now_dt = _now_kst()
     for d_off in range(0, 11):
         d_str = (now_dt - timedelta(days=d_off)).strftime("%Y%m%d")
         for slug in club_slugs:
@@ -608,7 +614,7 @@ def run_sheet_sync_scan() -> int:
     batch_updates: List[Dict[str, Any]] = []
     updated_count = 0
 
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ▶ 구글 시트 무결성 스캔 및 수리 시작 (총 {len(all_values)-1}개 행 점검)...")
+    print(f"\n[{_now_kst().strftime('%H:%M:%S')}] ▶ 구글 시트 무결성 스캔 및 수리 시작 (총 {len(all_values)-1}개 행 점검)...")
     club_history = _build_club_schedule_history(all_values)
 
     for row_idx in range(2, len(all_values) + 1):
@@ -868,7 +874,7 @@ def run_free_score_sync() -> int:
     if len(all_rows) < 2:
         return 0
 
-    now = datetime.now()
+    now = _now_kst()
     targets = []
     needed_slugs = set()
     min_dt, max_dt = None, None
@@ -1682,7 +1688,7 @@ def run_team_issue_sync() -> int:
 
     elo_dict = fetch_club_elo_map()
     club_history_issues = _build_club_schedule_history(all_rows)
-    now = datetime.now()
+    now = _now_kst()
     batch_updates = []
 
     header_ap = all_rows[0][41].strip() if len(all_rows[0]) > 41 else ""
