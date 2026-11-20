@@ -1080,21 +1080,31 @@ def _extract_espn_event_issues(slug: str, event_id: str, home_team: str, away_te
                 elif _teams_match(away_team, [t_name]):
                     a_items.append(summary_str)
 
-        # 2) rosters(선발/결장) 또는 keyEvents에서 퇴장/주요 변경 스캔
+        # 2) rosters(공식 선발 11명) 추출 -> 한국어 번역(1회 캐시, 약 0.4원) 후 [팀 한글명] 표기
+        h_starters_en: List[str] = []
+        a_starters_en: List[str] = []
         for r_group in data.get("rosters", []):
             t_name = r_group.get("team", {}).get("displayName", "")
             starters = []
             for player in r_group.get("roster", []):
                 if player.get("starter"):
-                    p_name = player.get("athlete", {}).get("shortName") or player.get("athlete", {}).get("displayName") or ""
+                    p_name = player.get("athlete", {}).get("displayName") or player.get("athlete", {}).get("shortName") or ""
                     if p_name:
                         starters.append(p_name)
             if starters:
-                lineup_str = "선발확정: " + ", ".join(starters[:5]) + " 등"
                 if _teams_match(home_team, [t_name]):
-                    h_items.append(lineup_str)
+                    h_starters_en = starters[:11]
                 elif _teams_match(away_team, [t_name]):
-                    a_items.append(lineup_str)
+                    a_starters_en = starters[:11]
+
+        if h_starters_en or a_starters_en:
+            h_ko_lbl = _to_ko_search_name(home_team)
+            a_ko_lbl = _to_ko_search_name(away_team)
+            h_ko_names, a_ko_names = _translate_lineup_names_ko(h_ko_lbl, a_ko_lbl, h_starters_en, a_starters_en)
+            if h_ko_names:
+                h_items.append(f"📋 [{h_ko_lbl}] 선발확정: " + "·".join(h_ko_names))
+            if a_ko_names:
+                a_items.append(f"📋 [{a_ko_lbl}] 선발확정: " + "·".join(a_ko_names))
     except Exception:
         pass
 
@@ -1113,6 +1123,61 @@ def _to_ko_search_name(team_name: str) -> str:
         if k.lower() == low or k.lower() in low or low in k.lower():
             return v
     return clean
+
+
+_LINEUP_KO_MEM_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
+
+
+def _translate_lineup_names_ko(
+    home_ko: str, away_ko: str, h_names: List[str], a_names: List[str]
+) -> Tuple[List[str], List[str]]:
+    """ESPN 공식 선발 11명 영문 이름을 한국 중계 표기(성 위주, 한국 선수는 풀네임)로 1회 초경량 번역"""
+    if not h_names and not a_names:
+        return [], []
+    sig = "|".join(h_names) + "||" + "|".join(a_names)
+    if sig in _LINEUP_KO_MEM_CACHE:
+        return _LINEUP_KO_MEM_CACHE[sig]
+
+    api_key = GEMINI_API_KEY.strip()
+    if not api_key:
+        return h_names[:11], a_names[:11]
+
+    prompt = (
+        "아래 축구 경기 공식 선발 명단을 한국 스포츠 중계에서 흔히 쓰는 자연스러운 한글 선수명(외국 선수는 성 위주, 한국·일본 선수는 풀네임)으로 번역해줘.\n"
+        f"- 홈팀({home_ko}): {', '.join(h_names)}\n"
+        f"- 원정팀({away_ko}): {', '.join(a_names)}\n"
+        '- 반드시 아래 JSON 형식으로만 답해: {"home": ["선수1", ...], "away": ["선수1", ...]}'
+    )
+    for model_id in GEMINI_MODEL_CHAIN:
+        if model_id in _EXHAUSTED_GEMINI_MODELS:
+            continue
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+        try:
+            resp = requests.post(
+                endpoint,
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 512, "responseMimeType": "application/json"},
+                },
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                cands = resp.json().get("candidates", [])
+                parts = cands[0].get("content", {}).get("parts", []) if cands else []
+                raw_txt = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+                m_json = re.search(r"\{.*\}", raw_txt, re.S)
+                if m_json:
+                    obj = json.loads(m_json.group(0))
+                    h_tr = [str(x).replace("|", "").replace(",", "").strip() for x in (obj.get("home") or []) if str(x).strip()]
+                    a_tr = [str(x).replace("|", "").replace(",", "").strip() for x in (obj.get("away") or []) if str(x).strip()]
+                    res = (h_tr if h_tr else h_names[:11], a_tr if a_tr else a_names[:11])
+                    _LINEUP_KO_MEM_CACHE[sig] = res
+                    return res
+            elif resp.status_code == 429:
+                _EXHAUSTED_GEMINI_MODELS.add(model_id)
+        except Exception:
+            pass
+    return h_names[:11], a_names[:11]
 
 
 ISSUE_INCLUDE_KW = (
@@ -1821,7 +1886,7 @@ def run_team_issue_sync() -> int:
                 batch_updates.append({"range": f"AP{idx}", "values": [[wait_msg]]})
                 updated_issues += 1
             continue
-        if curr_ap and "선발확정:" in curr_ap and "FIFA" not in curr_ap and "PPDA" not in curr_ap:
+        if curr_ap and re.search(r"선발확정:\s*[가-힣]", curr_ap) and "FIFA" not in curr_ap and "PPDA" not in curr_ap:
             continue
         within_48h_rows.append((idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko))
 
