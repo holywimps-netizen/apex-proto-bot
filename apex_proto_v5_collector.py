@@ -1283,6 +1283,33 @@ def _team_rest_note(stats: Dict[str, Any]) -> str:
     return ""
 
 
+def _has_real_issue_text(txt: str) -> bool:
+    """실제 선수·감독·선발 브리핑 내용이 들어있는지 판별 (안내 문구만 있는 경우 False)"""
+    s = str(txt or "").strip()
+    if not s:
+        return False
+    # 홈:/원정: 접두어 제거 후 검사
+    parts = [re.sub(r"^(홈|원정)\s*:\s*", "", p).strip() for p in s.split("||")]
+    for p in parts:
+        if not p:
+            continue
+        if "실시간 반영됩니다" in p or "특이 결장" in p or "체력완충" in p or "FIFA" in p or "PPDA" in p:
+            continue
+        return True
+    return False
+
+
+def _split_existing_ap(curr_ap: str) -> Tuple[str, str]:
+    """시트 AP열에 이미 저장된 유효 브리핑을 (홈, 원정)으로 분리 반환 (안내 문구면 빈 문자열)"""
+    s = str(curr_ap or "").strip()
+    if not s or "||" not in s:
+        return "", ""
+    h_raw, a_raw = [re.sub(r"^(홈|원정)\s*:\s*", "", p).strip() for p in s.split("||", 1)]
+    h_ok = h_raw if _has_real_issue_text(h_raw) else ""
+    a_ok = a_raw if _has_real_issue_text(a_raw) else ""
+    return h_ok, a_ok
+
+
 def _build_quant_tactical_issue(
     home_team: str,
     away_team: str,
@@ -1816,7 +1843,7 @@ def run_team_issue_sync() -> int:
             if has_stage_cache:
                 item_obj["ai_h"] = cached_entry.get("home", "")
                 item_obj["ai_a"] = cached_entry.get("away", "")
-            elif "선발확정:" not in h_ext or "선발확정:" not in a_ext:
+            elif hrs_to_ko > 0 and ("선발확정:" not in h_ext or "선발확정:" not in a_ext):
                 grounding_todo.append(item_obj)
         else:
             rss_fallback_rows.append(item_obj)
@@ -1832,14 +1859,15 @@ def run_team_issue_sync() -> int:
         fh, fa, ok_first = _ask_gemini_grounded_match_issue(first_it)
         if ok_first:
             batch_results[first_it["cache_key"]] = (fh, fa)
-            ai_cache[first_it["cache_key"]] = {
-                "ver": "v6_grounding",
-                "stage": first_it["stage"],
-                "ts": now_ts,
-                "home": fh,
-                "away": fa,
-            }
-            ai_cache_dirty = True
+            if fh or fa:
+                ai_cache[first_it["cache_key"]] = {
+                    "ver": "v6_grounding",
+                    "stage": first_it["stage"],
+                    "ts": now_ts,
+                    "home": fh,
+                    "away": fa,
+                }
+                ai_cache_dirty = True
             rest_todo = grounding_todo[1:]
             if rest_todo:
                 with ThreadPoolExecutor(max_workers=4) as pool:
@@ -1849,14 +1877,15 @@ def run_team_issue_sync() -> int:
                             gh, ga, ok = fut.result(timeout=40)
                             if ok:
                                 batch_results[it["cache_key"]] = (gh, ga)
-                                ai_cache[it["cache_key"]] = {
-                                    "ver": "v6_grounding",
-                                    "stage": it["stage"],
-                                    "ts": now_ts,
-                                    "home": gh,
-                                    "away": ga,
-                                }
-                                ai_cache_dirty = True
+                                if gh or ga:
+                                    ai_cache[it["cache_key"]] = {
+                                        "ver": "v6_grounding",
+                                        "stage": it["stage"],
+                                        "ts": now_ts,
+                                        "home": gh,
+                                        "away": ga,
+                                    }
+                                    ai_cache_dirty = True
                         except Exception:
                             pass
         else:
@@ -1949,9 +1978,20 @@ def run_team_issue_sync() -> int:
         is_am = any(k in item["league"].lower() for k in ("nations", "world cup", "qual", "euro", "asian", "copa", "friendly", "international"))
         h_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["home"], item["kdt"], club_history_issues)
         a_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["away"], item["kdt"], club_history_issues)
+        # 기존 시트에 이미 수집된 유효 브리핑이 있다면, 이번 회차 빈 응답으로 절대 덮어쓰지 않고 보존!
+        prev_h, prev_a = _split_existing_ap(item["curr_ap"])
+        if not _has_real_issue_text(h_ext) and prev_h:
+            h_ext = prev_h
+        if not _has_real_issue_text(a_ext) and prev_a:
+            a_ext = prev_a
+
         issue_text = _build_quant_tactical_issue(
             item["home"], item["away"], h_stats, a_stats, h_ext, a_ext, hours_to_ko=item["hrs_to_ko"]
         )
+
+        # 기존에 유효 브리핑이 있는데 새 텍스트가 빈 안내 문구뿐이라면 덮어쓰기 차단
+        if _has_real_issue_text(item["curr_ap"]) and not _has_real_issue_text(issue_text):
+            continue
 
         if issue_text and issue_text != item["curr_ap"]:
             batch_updates.append({"range": f"AP{item['idx']}", "values": [[issue_text]]})
