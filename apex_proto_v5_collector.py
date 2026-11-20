@@ -26,8 +26,7 @@ import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from typing import Dict, Any, Tuple, List
-
+from typing import Dict, Any, Tuple, List, Optional
 import requests
 import numpy as np
 import pandas as pd
