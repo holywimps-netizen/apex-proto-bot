@@ -2113,12 +2113,174 @@ def run_team_issue_sync() -> int:
     return updated_issues
 
 
+
+def run_round_briefing_sync() -> bool:
+    """예정 경기 일정(첫 경기~마지막 경기)과 시즌/A매치/UCL/피로 패턴을 분석해 주 2회(또는 구간 변경 시) AI 라운드 총평을 시트 AQ1 셀에 자동 기록"""
+    ws = _get_sheet()
+    if not ws:
+        return False
+
+    try:
+        rows = ws.get_all_values()
+    except Exception as e:
+        print(f"[라운드 총평 오류] 시트 읽기 실패: {e}")
+        return False
+    if len(rows) <= 1:
+        return False
+
+    now = _now_kst()
+    header = rows[0]
+    curr_aq1 = header[42].strip() if len(header) > 42 else ""
+
+    upcoming = []
+    recent_amatch = False
+    has_ucl = False
+    short_rest_cnt = 0
+    leagues_set = set()
+
+    for r in rows[1:]:
+        if len(r) < 5:
+            continue
+        lg = r[1].strip()
+        kt = r[2].strip()
+        kdt = _parse_kickoff_dt(kt)
+        if not kdt:
+            continue
+        hrs_diff = (kdt - now).total_seconds() / 3600.0
+        is_am = any(k in lg.lower() for k in ("nations", "world cup", "qual", "friendly", "international"))
+        if is_am and -360 <= hrs_diff <= 0:
+            recent_amatch = True
+        if hrs_diff >= -2.5:
+            upcoming.append((kdt, lg, r[3].strip(), r[4].strip()))
+            leagues_set.add(lg)
+            if "champions" in lg.lower() or "ucl" in lg.lower():
+                has_ucl = True
+            try:
+                rh = float(r[36]) if len(r) > 36 and r[36] else 168.0
+                ra = float(r[37]) if len(r) > 37 and r[37] else 168.0
+                if rh < 72 or ra < 72:
+                    short_rest_cnt += 1
+            except Exception:
+                pass
+
+    if not upcoming:
+        return False
+
+    upcoming.sort(key=lambda x: x[0])
+    first_dt = upcoming[0][0]
+    last_dt = upcoming[-1][0]
+    days_ko = ["월", "화", "수", "목", "금", "토", "일"]
+    period_disp = f"{first_dt.strftime('%m.%d')} ({days_ko[first_dt.weekday()]}) ~ {last_dt.strftime('%m.%d')} ({days_ko[last_dt.weekday()]})"
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}"
+    today_str = now.strftime("%Y-%m-%d")
+
+    # 이미 같은 일정 구간으로 최근 3일 이내 생성된 총평이 AQ1에 있으면 API 호출 0회 스킵!
+    if curr_aq1.startswith("ROUND_BRIEF::"):
+        parts = curr_aq1.split("::")
+        if len(parts) >= 4 and parts[1] == period_key:
+            try:
+                gen_dt = datetime.strptime(parts[2], "%Y-%m-%d")
+                if (now.date() - gen_dt.date()).days < 3:
+                    return False
+            except Exception:
+                pass
+
+    # Gemini 1회 호출로 똑똑한 라운드 총평 생성 (월 10원 미만)
+    month = now.month
+    season_ctx = (
+        "시즌 막바지(우승·유럽대항전·강등권 동기부여 격차 극대화 시기)" if month in (4, 5)
+        else ("연말·연초 빡빡한 일정(체력 혹사·로테이션 변수)" if month in (12, 1)
+        else ("시즌 초반(전술 적응·승격팀 이변 구간)" if month in (8, 9)
+        else "시즌 중반(순위 경쟁 및 주중 컵대회 체력 분배 구간)"))
+    )
+    sample_matches = ", ".join(f"{_to_ko_search_name(h)} vs {_to_ko_search_name(a)}" for _, _, h, a in upcoming[:8])
+
+    headline = ""
+    bullets = []
+
+    if GEMINI_API_KEY:
+        prompt = (
+            f"당신은 한국 축구 데이터 분석 플랫폼 '경기판단 챌린지'의 수석 에디터입니다.\n"
+            f"이번 라운드 일정({period_disp}, 총 {len(upcoming)}경기)의 핵심 특징을 이용자가 승·무·패 판단 전에 10초 만에 파악하도록 총평을 작성하세요.\n"
+            f"[일정 컨텍스트]\n"
+            f"- 대상 기간: {period_disp}\n"
+            f"- 직전 2주 내 A매치 데이 여부: {'예 (A매치 직후 첫 클럽 라운드)' if recent_amatch else '아니오'}\n"
+            f"- 주중 챔피언스리그(UCL) 포함 여부: {'예' if has_ucl else '아니오'}\n"
+            f"- 72시간 미만 단기 휴식 피로 경기 수: {short_rest_cnt}경기\n"
+            f"- 시즌 시기: {season_ctx}\n"
+            f"- 주요 경기 예시: {sample_matches}\n\n"
+            f"[출력 규칙 - 엄수]\n"
+            f"1) 쉼표(,)와 줄바꿈, 마크다운 기호 없이 아래 JSON 1개만 출력하세요.\n"
+            f'   {{"headline": "35자 이내 강렬한 1줄 핵심 요약", "bullets": ["핵심 포인트1 (60자 이내)", "핵심 포인트2 (60자 이내)", "핵심 포인트3 (60자 이내)"]}}\n'
+            f"2) 베팅 권유 금지, 데이터·일정·체력·동기부여 관점의 객관적 관전 포인트만 작성하세요."
+        )
+        for model_name in GEMINI_MODEL_CHAIN:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 400},
+                }
+                resp = requests.post(url, json=payload, timeout=15)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw_txt = ""
+                    for cand in data.get("candidates", []):
+                        for part in cand.get("content", {}).get("parts", []):
+                            raw_txt += part.get("text", "")
+                    m_json = re.search(r"\{[\s\S]*\}", raw_txt)
+                    if m_json:
+                        obj = json.loads(m_json.group(0))
+                        headline = str(obj.get("headline") or "").replace(",", "·").replace("::", " ").replace("||", " ").strip()
+                        raw_b = obj.get("bullets") or []
+                        bullets = [str(x).replace(",", "·").replace("::", " ").replace("||", " ").strip() for x in raw_b if str(x).strip()][:3]
+                        if headline and bullets:
+                            break
+            except Exception:
+                continue
+
+    # AI 키 없거나 실패 시 안전한 규칙 기반 폴백
+    if not headline:
+        if recent_amatch:
+            headline = "A매치 직후 FIFA 바이러스 경계 · 빅클럽 로테이션 변수 주의"
+            bullets = [
+                "국가대표 차출이 많은 강팀은 장거리 이동 피로로 초반 경기력 저하·이변 빈도가 높습니다.",
+                "주전 휴식 여부 확인을 위해 킥오프 1시간 전 자동 반영되는 공식 선발 라인업을 꼭 체크하세요.",
+                f"이번 구간({period_disp})은 휴식시간 72h 미만 단기 일정 팀과 원정 약체 반등 변수가 핵심입니다."
+            ]
+        elif has_ucl:
+            headline = "주중 UCL 병행 라운드 · 유럽대항전 진출팀 체력 분배 핵심"
+            bullets = [
+                "주중 챔피언스리그를 치르는 구단은 리그 경기에서 부분 로테이션을 가동할 가능성이 높습니다.",
+                "휴식시간 격차가 큰 매치업에서는 후반 압박(PPDA) 저하와 실점 증가 패턴에 주목하세요.",
+                f"이번 구간({period_disp})은 {season_ctx} 흐름이 맞물려 팀 이슈 브리핑 확인이 중요합니다."
+            ]
+        else:
+            headline = f"{season_ctx.split('(')[0].strip()} 라운드 · 홈/원정 기대득점(xG) 격차 주목"
+            bullets = [
+                f"이번 구간({period_disp}) 총 {len(upcoming)}경기가 예정되어 있으며 {season_ctx} 구간입니다.",
+                "비페널티 기대득점(npxG)과 허용 기대실점(xGA) 차이가 뚜렷한 경기일수록 정배 안정도가 높습니다.",
+                "킥오프 1시간 전 공식 선발 라인업과 부상·징계 브리핑을 함께 대조해 이변을 걸러내세요."
+            ]
+
+    packed = f"ROUND_BRIEF::{period_key}::{today_str}::{period_disp}::{headline}||" + "||".join(bullets)
+    if not DRY_RUN:
+        try:
+            ws.update_acell("AQ1", packed)
+            print(f"✅ [라운드 총평 갱신] ({period_disp}) -> {headline}")
+            return True
+        except Exception as e:
+            print(f"[라운드 총평 저장 오류] {e}")
+    return False
+
+
 async def periodic_scanner_worker():
     cycle = 0
     while True:
         if cycle % QUANT_SCAN_CYCLES == 0:
             await asyncio.to_thread(run_sheet_sync_scan)
             await asyncio.to_thread(run_team_issue_sync)
+            await asyncio.to_thread(run_round_briefing_sync)
         await asyncio.to_thread(run_free_score_sync)
         cycle += 1
         print(f"▶ 다음 무료 스코어 체크까지 {SCORE_INTERVAL_SEC}초 대기 중... (종료: Ctrl+C)")
@@ -2150,6 +2312,7 @@ async def main():
             await asyncio.to_thread(run_sheet_sync_scan)
         if args.mode in ("all", "issues"):
             await asyncio.to_thread(run_team_issue_sync)
+            await asyncio.to_thread(run_round_briefing_sync)
         if args.mode in ("all", "score"):
             await asyncio.to_thread(run_free_score_sync)
         print("✅ [클라우드 1회 실행 완료] 정상 종료합니다.")
