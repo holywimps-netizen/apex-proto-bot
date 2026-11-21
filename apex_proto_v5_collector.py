@@ -2116,14 +2116,13 @@ def run_team_issue_sync() -> int:
 
 def run_round_briefing_sync() -> bool:
     """예정 경기 일정(첫 경기~마지막 경기)과 시즌/A매치/UCL/피로 패턴을 분석해 주 2회(또는 구간 변경 시) AI 라운드 총평을 시트 AQ1 셀에 자동 기록"""
-    ws = _get_sheet()
-    if not ws:
-        return False
-
     try:
+        gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        ws = sh.worksheet(MAIN_SHEET_NAME)
         rows = ws.get_all_values()
     except Exception as e:
-        print(f"[라운드 총평 오류] 시트 읽기 실패: {e}")
+        print(f"[라운드 총평 오류] 시트 접속/읽기 실패: {e}")
         return False
     if len(rows) <= 1:
         return False
@@ -2143,8 +2142,9 @@ def run_round_briefing_sync() -> bool:
             continue
         lg = r[1].strip()
         kt = r[2].strip()
-        kdt = _parse_kickoff_dt(kt)
-        if not kdt:
+        try:
+            kdt = datetime.strptime(kt.replace("T", " ")[:16], "%Y-%m-%d %H:%M")
+        except Exception:
             continue
         hrs_diff = (kdt - now).total_seconds() / 3600.0
         is_am = any(k in lg.lower() for k in ("nations", "world cup", "qual", "friendly", "international"))
@@ -2266,6 +2266,8 @@ def run_round_briefing_sync() -> bool:
     packed = f"ROUND_BRIEF::{period_key}::{today_str}::{period_disp}::{headline}||" + "||".join(bullets)
     if not DRY_RUN:
         try:
+            if getattr(ws, "col_count", 43) < 43:
+                ws.add_cols(43 - ws.col_count)
             ws.update_acell("AQ1", packed)
             print(f"✅ [라운드 총평 갱신] ({period_disp}) -> {headline}")
             return True
