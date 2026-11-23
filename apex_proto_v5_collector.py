@@ -2126,7 +2126,7 @@ def _classify_round_competition(lg: str) -> str:
 
 
 def run_round_briefing_sync() -> bool:
-    """예정 경기를 대회별(리그 경기·챔피언스리그·컵대회·A매치)로 명확히 구분해 상위 Gemini 4 모델로 라운드 총평을 시트 AQ1에 자동 기록"""
+    """현재 기준 근접 라운드(향후 84시간 내)만 추려 대회·연속 일정 블록별(리그 마감/주말 리그·챔피언스리그·컵대회·A매치)로 명확히 구분해 Gemini 4로 라운드 총평을 AQ1에 자동 기록"""
     try:
         gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
         sh = gc.open_by_key(SPREADSHEET_ID)
@@ -2142,9 +2142,8 @@ def run_round_briefing_sync() -> bool:
     header = rows[0]
     curr_aq1 = header[42].strip() if len(header) > 42 else ""
 
-    upcoming = []
+    all_upcoming = []
     recent_amatch = False
-    short_rest_cnt = 0
 
     for r in rows[1:]:
         if len(r) < 5:
@@ -2168,16 +2167,25 @@ def run_round_briefing_sync() -> bool:
                 rh = float(r[36]) if len(r) > 36 and r[36] else 168.0
                 ra = float(r[37]) if len(r) > 37 and r[37] else 168.0
                 if rh < 72 or ra < 72:
-                    short_rest_cnt += 1
                     is_short = True
             except Exception:
                 pass
-            upcoming.append({"kdt": kdt, "lg": lg, "cat": cat, "short_rest": is_short})
+            all_upcoming.append({"kdt": kdt, "lg": lg, "cat": cat, "short_rest": is_short, "hrs": hrs_diff})
 
-    if not upcoming:
+    if not all_upcoming:
         return False
 
-    upcoming.sort(key=lambda x: x["kdt"])
+    all_upcoming.sort(key=lambda x: x["kdt"])
+
+    # 1) 현재 라운드 윈도우 필터: 향후 84시간(3.5일) 이내 경기 우선 선택 (다음 주말 경기가 주중 UCL 총평에 섞이는 현상 원천 차단!)
+    window_matches = [x for x in all_upcoming if x["hrs"] <= 84.0]
+    if not window_matches:
+        # 84시간 내 경기가 없으면 가장 가까운 첫 경기 기준 +84시간 구간 선택
+        anchor_hrs = all_upcoming[0]["hrs"]
+        window_matches = [x for x in all_upcoming if x["hrs"] <= anchor_hrs + 84.0]
+
+    upcoming = window_matches
+    short_rest_cnt = sum(1 for x in upcoming if x["short_rest"])
     days_ko = ["월", "화", "수", "목", "금", "토", "일"]
 
     def _fmt_range(items):
@@ -2188,27 +2196,47 @@ def run_round_briefing_sync() -> bool:
         s2 = f"{d2.strftime('%d')}({days_ko[d2.weekday()]})" if d1.month == d2.month else f"{d2.strftime('%m.%d')}({days_ko[d2.weekday()]})"
         return f"{s1}~{s2}"
 
-    # 대회별 버킷 분리 (첫 경기 시간순 정렬)
-    buckets_map = {}
+    # 2) 대회별 + 48시간 이상 간격 시 별도 블록으로 분리 (지난 주말 화요일 잔여 경기와 다음 주말 토요일 경기가 절대 합쳐지지 않음)
+    raw_by_cat = {}
     for it in upcoming:
-        buckets_map.setdefault(it["cat"], []).append(it)
-    buckets = sorted(buckets_map.items(), key=lambda kv: kv[1][0]["kdt"])
+        raw_by_cat.setdefault(it["cat"], []).append(it)
 
-    short_cat = {"리그 경기": "리그", "챔피언스리그": "UCL", "유럽대항전": "유럽", "컵대회": "컵", "A매치": "A매치"}
+    buckets = []
+    for cat, its in raw_by_cat.items():
+        its.sort(key=lambda x: x["kdt"])
+        cur_group = [its[0]]
+        for x in its[1:]:
+            if (x["kdt"] - cur_group[-1]["kdt"]).total_seconds() > 48 * 3600:
+                buckets.append((cat, cur_group))
+                cur_group = [x]
+            else:
+                cur_group.append(x)
+        buckets.append((cat, cur_group))
+
+    buckets.sort(key=lambda kv: kv[1][0]["kdt"])
+
+    # 블록별 표시명 정리 (월·화 소수 리그 경기는 '리그 마감', 일반 주말은 '리그 경기')
+    labeled_buckets = []
+    for cat, its in buckets:
+        is_tail = (cat == "리그 경기" and len(its) <= 6 and all(x["kdt"].weekday() in (0, 1) for x in its))
+        full_label = "리그 마감" if is_tail else cat
+        short_label = "리그 마감" if is_tail else {"리그 경기": "리그", "챔피언스리그": "UCL", "유럽대항전": "유럽", "컵대회": "컵", "A매치": "A매치"}.get(cat, cat)
+        labeled_buckets.append((full_label, short_label, its, is_tail))
+
     first_dt = upcoming[0]["kdt"]
     last_dt = upcoming[-1]["kdt"]
-    period_disp = " · ".join([f"{short_cat.get(cat, cat)} {_fmt_range(its)}" for cat, its in buckets])
-    cat_sig = "+".join([f"{cat}:{len(its)}" for cat, its in buckets])
-    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v5"
+    period_disp = " · ".join([f"{sl} {_fmt_range(its)}" for _, sl, its, _ in labeled_buckets])
+    cat_sig = "+".join([f"{fl}:{len(its)}" for fl, _, its, _ in labeled_buckets])
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v6"
     today_str = now.strftime("%Y-%m-%d")
 
-    # 이미 같은 일정·대회 구간(v4)으로 최근 2일 이내 생성된 총평이 AQ1에 있으면 API 호출 0회 스킵!
+    # 이미 같은 일정·대회 구간(v6)으로 최근 1일 이내 생성된 총평이 AQ1에 있으면 API 호출 스킵
     if curr_aq1.startswith("ROUND_BRIEF::"):
         parts = curr_aq1.split("::")
         if len(parts) >= 4 and parts[1] == period_key:
             try:
                 gen_dt = datetime.strptime(parts[2], "%Y-%m-%d")
-                if (now.date() - gen_dt.date()).days < 2:
+                if (now.date() - gen_dt.date()).days < 1:
                     return False
             except Exception:
                 pass
@@ -2222,13 +2250,14 @@ def run_round_briefing_sync() -> bool:
     )
 
     bucket_lines = []
-    for cat, its in buckets:
+    exact_tags = []
+    for fl, _, its, is_tail in labeled_buckets:
         r_str = _fmt_range(its)
+        tag = f"[{fl} · {r_str}]"
+        exact_tags.append(tag)
         sr_cnt = sum(1 for x in its if x["short_rest"])
-        tail_note = ""
-        if cat == "리그 경기" and len(its) <= 6 and all(x["kdt"].weekday() in (0, 1) for x in its):
-            tail_note = " — 주말 리그 라운드 마지막 잔여 경기(연장선)"
-        bucket_lines.append(f"- [{cat} · {r_str}] 예정 {len(its)}경기 (72h 미만 단기휴식 {sr_cnt}경기){tail_note}")
+        tail_note = " — 주말 리그 라운드 마지막 잔여 경기(연장선)" if is_tail else ""
+        bucket_lines.append(f"- {tag} 예정 {len(its)}경기 (72h 미만 단기휴식 {sr_cnt}경기){tail_note}")
     buckets_ctx_str = "\n".join(bucket_lines)
 
     if recent_amatch:
@@ -2240,34 +2269,34 @@ def run_round_briefing_sync() -> bool:
 
     headline = ""
     bullets = []
-    # 한 단계 더 똑똑한 상위 Gemini 4 모델 최우선 사용 (자동 폴백 체인 포함)
     briefing_models = ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
     if GEMINI_API_KEY:
-        multi_cat_guide = (
-            "대회가 2개 이상 섞여 있으므로, 각 대회별로 반드시 구분해서 작성하세요. "
-            "각 포인트는 반드시 '[대회명 · 기간] 내용' 형식으로 시작하세요. "
-            "(예: '[리그 경기 · 11.24 (화)] ...', '[챔피언스리그 · 11.25 (수) ~ 11.26 (목)] ...') "
-            "총 3~4개 포인트로 작성하되, 경기 수가 많은 메인 대회는 2개 포인트, 소규모 대회는 1개 포인트로 배분하세요."
-            if len(buckets) >= 2 else
-            f"단일 대회({buckets[0][0]}) 구간이므로, 모든 포인트는 '[{buckets[0][0]} · {_fmt_range(buckets[0][1])}] ' 대신 "
-            f"첫 포인트에 '[{buckets[0][0]} · {_fmt_range(buckets[0][1])}] '를 붙이거나 핵심 관전 포인트 3개를 간결히 작성하세요."
-        )
+        if len(labeled_buckets) >= 2:
+            tag_rule = (
+                f"각 대회 블록마다 딱 1개씩만 핵심 포인트를 작성해, 총 {len(labeled_buckets)}개 포인트로 출력하세요. "
+                f"같은 태그를 두 번 반복하지 마세요. 반드시 아래 태그를 그대로 맨 앞에 붙이세요: " + ", ".join(exact_tags)
+            )
+        else:
+            tag_rule = (
+                f"단일 대회({exact_tags[0]}) 구간이므로, 핵심 관전 포인트 3개를 작성하되 "
+                f"첫 번째 포인트 맨 앞에만 '{exact_tags[0]} '를 붙이고 나머지 2개는 태그 없이 자연스럽게 작성하세요."
+            )
         prompt = (
             f"당신은 한국 축구 데이터 분석 플랫폼 '경기판단 챌린지'의 수석 에디터입니다.\n"
-            f"아래 예정 경기들의 대회별 경계를 명확히 구분해, 이용자가 판단 전 읽으면 실전 도움이 되는 라운드 총평을 작성하세요.\n\n"
-            f"[대회별 예정 일정 ({period_disp}, 총 {len(upcoming)}경기)]\n"
+            f"아래 현재 라운드의 대회별 일정과 성격을 정확히 구분해, 이용자가 판단 전 읽으면 실전 도움이 되는 깔끔한 라운드 총평을 작성하세요.\n\n"
+            f"[현재 라운드 대회별 일정 ({period_disp}, 총 {len(upcoming)}경기)]\n"
             f"{buckets_ctx_str}\n\n"
             f"[거시 컨텍스트]\n"
             f"- 일정·체력 흐름: {fatigue_ctx}\n"
             f"- 시즌 시기 특성: {season_ctx}\n\n"
             f"[엄격한 작성 규칙]\n"
-            f"1) {multi_cat_guide}\n"
-            f"2) 리그 경기와 챔피언스리그·컵대회·A매치의 성격 차이를 명확히 구분하고 절대 한데 뭉뚱그리지 마세요.\n"
+            f"1) {tag_rule}\n"
+            f"2) 챔피언스리그는 2024/25 시즌부터 개편된 '리그 페이즈(36개 팀 단일 순위)' 방식이므로 절대 '조별리그'라고 쓰지 마세요.\n"
             f"3) 특정 구단명이나 특정 경기 이름은 언급하지 말고 대회·라운드 전체에 통용되는 전략적 흐름만 쓰세요.\n"
             f"4) '베팅', '배당 수익', '도박' 표현 금지. 새벽 직전 '선발 라인업 확인' 같은 뻔한 권고 금지.\n"
-            f"5) 쉼표(,)와 줄바꿈, 마크다운 기호 없이 아래 JSON 1개만 출력하세요.\n"
-            f'   {{"headline": "34자 이내 핵심 1줄 제목 (대회 구분이 드러나게)", "bullets": ["포인트1 (68자 이내)", "포인트2 (68자 이내)", "포인트3 (68자 이내)"]}}'
+            f"5) 각 포인트는 75자 이내로 구체적이고 읽기 쉽게 작성하고, 쉼표(,)·줄바꿈·마크다운 없이 아래 JSON 1개만 출력하세요.\n"
+            f'   {{"headline": "32자 이내 핵심 1줄 제목", "bullets": ["포인트1", "포인트2"]}}'
         )
         for model_name in briefing_models:
             try:
@@ -2289,10 +2318,10 @@ def run_round_briefing_sync() -> bool:
                         headline = str(obj.get("headline") or "").replace(",", "·").replace("::", " ").replace("||", " ").strip()
                         raw_b = obj.get("bullets") or []
                         bullets = [
-                            str(x).replace(",", "·").replace("::", " ").replace("||", " ").replace("베팅", "판단").strip()
+                            str(x).replace(",", "·").replace("::", " ").replace("||", " ").replace("베팅", "판단").replace("조별리그", "리그 페이즈").strip()
                             for x in raw_b if str(x).strip()
                         ][:4]
-                        if headline and len(bullets) >= 2:
+                        if headline and len(bullets) >= 1:
                             print(f"[라운드 총평] {model_name} 생성 성공 ({cat_sig})")
                             break
             except Exception as e:
@@ -2300,19 +2329,21 @@ def run_round_briefing_sync() -> bool:
                 continue
 
     if not headline:
-        cat_names = " · ".join([c for c, _ in buckets])
-        headline = f"{cat_names} 일정 분리 구간 · 대회별 체력·동기부여 변수 주목"
+        cat_names = " · ".join([fl for fl, _, _, _ in labeled_buckets])
+        headline = f"{cat_names} · 대회별 체력·동기부여 핵심 변수 주목"
         bullets = []
-        for cat, its in buckets:
+        for fl, _, its, is_tail in labeled_buckets:
             r_str = _fmt_range(its)
-            if cat == "챔피언스리그":
-                bullets.append(f"[{cat} · {r_str}] 유럽대항전 특유의 원정 부담과 조별·리그 페이즈 승점 압박이 전술 강도를 끌어올립니다.")
-            elif cat == "A매치":
-                bullets.append(f"[{cat} · {r_str}] 국가대표 소집 일정은 짧은 조직력 훈련과 장거리 이동 변수가 크게 작용합니다.")
-            elif cat == "컵대회":
-                bullets.append(f"[{cat} · {r_str}] 단판 토너먼트 특성상 로테이션 폭과 하위 리그 팀의 홈 집중력이 이변 변수가 됩니다.")
+            if fl == "챔피언스리그":
+                bullets.append(f"[{fl} · {r_str}] 리그 페이즈 중후반 순위 경쟁이 치열해지며 원정 피로와 스쿼드 로테이션 폭이 핵심 변수입니다.")
+            elif fl == "A매치":
+                bullets.append(f"[{fl} · {r_str}] 국가대표 소집 일정은 짧은 조직력 훈련과 장거리 이동 변수가 크게 작용합니다.")
+            elif fl == "컵대회":
+                bullets.append(f"[{fl} · {r_str}] 단판 토너먼트 특성상 로테이션 폭과 하위 리그 팀의 홈 집중력이 이변 변수가 됩니다.")
+            elif is_tail:
+                bullets.append(f"[{fl} · {r_str}] 주말 리그 라운드 마지막 잔여 경기로 순위 경쟁 동기부여와 홈 어드밴티지가 정직하게 반영됩니다.")
             else:
-                bullets.append(f"[{cat} · {r_str}] 정규 리그 잔여·주말 일정은 순위 경쟁 동기부여와 홈·원정 밸런스가 정직하게 반영됩니다.")
+                bullets.append(f"[{fl} · {r_str}] 정규 리그 라운드는 체력 회복 상태와 최근 5경기 흐름·홈 원정 밸런스가 결과를 가릅니다.")
 
     aq1_val = f"ROUND_BRIEF::{period_key}::{today_str}::{period_disp}::{headline}||" + "||".join(bullets)
     try:
