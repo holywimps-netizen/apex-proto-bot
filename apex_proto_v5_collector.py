@@ -2182,9 +2182,11 @@ def run_round_briefing_sync() -> bool:
 
     def _fmt_range(items):
         d1, d2 = items[0]["kdt"], items[-1]["kdt"]
-        s1 = f"{d1.strftime('%m.%d')} ({days_ko[d1.weekday()]})"
-        s2 = f"{d2.strftime('%m.%d')} ({days_ko[d2.weekday()]})"
-        return s1 if d1.date() == d2.date() else f"{s1} ~ {s2}"
+        s1 = f"{d1.strftime('%m.%d')}({days_ko[d1.weekday()]})"
+        if d1.date() == d2.date():
+            return s1
+        s2 = f"{d2.strftime('%d')}({days_ko[d2.weekday()]})" if d1.month == d2.month else f"{d2.strftime('%m.%d')}({days_ko[d2.weekday()]})"
+        return f"{s1}~{s2}"
 
     # 대회별 버킷 분리 (첫 경기 시간순 정렬)
     buckets_map = {}
@@ -2192,11 +2194,12 @@ def run_round_briefing_sync() -> bool:
         buckets_map.setdefault(it["cat"], []).append(it)
     buckets = sorted(buckets_map.items(), key=lambda kv: kv[1][0]["kdt"])
 
+    short_cat = {"리그 경기": "리그", "챔피언스리그": "UCL", "유럽대항전": "유럽", "컵대회": "컵", "A매치": "A매치"}
     first_dt = upcoming[0]["kdt"]
     last_dt = upcoming[-1]["kdt"]
-    period_disp = _fmt_range(upcoming)
+    period_disp = " · ".join([f"{short_cat.get(cat, cat)} {_fmt_range(its)}" for cat, its in buckets])
     cat_sig = "+".join([f"{cat}:{len(its)}" for cat, its in buckets])
-    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v4"
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v5"
     today_str = now.strftime("%Y-%m-%d")
 
     # 이미 같은 일정·대회 구간(v4)으로 최근 2일 이내 생성된 총평이 AQ1에 있으면 API 호출 0회 스킵!
@@ -2222,7 +2225,10 @@ def run_round_briefing_sync() -> bool:
     for cat, its in buckets:
         r_str = _fmt_range(its)
         sr_cnt = sum(1 for x in its if x["short_rest"])
-        bucket_lines.append(f"- [{cat} · {r_str}] 예정 {len(its)}경기 (72h 미만 단기휴식 {sr_cnt}경기)")
+        tail_note = ""
+        if cat == "리그 경기" and len(its) <= 6 and all(x["kdt"].weekday() in (0, 1) for x in its):
+            tail_note = " — 주말 리그 라운드 마지막 잔여 경기(연장선)"
+        bucket_lines.append(f"- [{cat} · {r_str}] 예정 {len(its)}경기 (72h 미만 단기휴식 {sr_cnt}경기){tail_note}")
     buckets_ctx_str = "\n".join(bucket_lines)
 
     if recent_amatch:
