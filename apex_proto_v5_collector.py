@@ -1523,13 +1523,16 @@ def _ask_gemini_grounded_match_issue(item: Dict[str, Any]) -> Tuple[str, str, bo
         if model_id in _EXHAUSTED_GEMINI_MODELS:
             continue
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
+        gen_cfg = {"temperature": 0.1, "maxOutputTokens": 1536}
+        if "gemini-4" in model_id or "3.8" in model_id:
+            gen_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "tools": [{"google_search": {}}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+            "generationConfig": gen_cfg,
         }
         try:
-            resp = requests.post(endpoint, json=payload, timeout=30)
+            resp = requests.post(endpoint, json=payload, timeout=45)
             if resp.status_code == 200:
                 data = resp.json()
                 cands = data.get("candidates", [])
@@ -1996,13 +1999,13 @@ def run_team_issue_sync() -> int:
             rest_todo = grounding_todo[1:]
             if rest_todo:
                 def _paced_grounding(it_arg):
-                    time.sleep(0.8)
+                    time.sleep(0.25)
                     return _ask_gemini_grounded_match_issue(it_arg)
-                with ThreadPoolExecutor(max_workers=2) as pool:
+                with ThreadPoolExecutor(max_workers=4) as pool:
                     fut_map = {pool.submit(_paced_grounding, it): it for it in rest_todo}
                     for fut, it in fut_map.items():
                         try:
-                            gh, ga, ok = fut.result(timeout=40)
+                            gh, ga, ok = fut.result(timeout=90)
                             if ok:
                                 batch_results[it["cache_key"]] = (gh, ga)
                                 if gh or ga:
@@ -2202,12 +2205,12 @@ def run_round_briefing_sync() -> bool:
 
     all_upcoming.sort(key=lambda x: x["kdt"])
 
-    # 1) 현재 라운드 윈도우 필터: 향후 84시간(3.5일) 이내 경기 우선 선택 (다음 주말 경기가 주중 UCL 총평에 섞이는 현상 원천 차단!)
-    window_matches = [x for x in all_upcoming if x["hrs"] <= 84.0]
+    # 1) 현재 라운드 윈도우 필터: 향후 60시간(2.5일) 이내 경기 우선 선택 (다음 주말 경기가 주중 UCL 총평에 절대 섞이지 않도록 차단!)
+    window_matches = [x for x in all_upcoming if x["hrs"] <= 60.0]
     if not window_matches:
-        # 84시간 내 경기가 없으면 가장 가까운 첫 경기 기준 +84시간 구간 선택
+        # 60시간 내 경기가 없으면 가장 가까운 첫 경기 기준 +72시간 구간 선택
         anchor_hrs = all_upcoming[0]["hrs"]
-        window_matches = [x for x in all_upcoming if x["hrs"] <= anchor_hrs + 84.0]
+        window_matches = [x for x in all_upcoming if x["hrs"] <= anchor_hrs + 72.0]
 
     upcoming = window_matches
     short_rest_cnt = sum(1 for x in upcoming if x["short_rest"])
@@ -2252,7 +2255,7 @@ def run_round_briefing_sync() -> bool:
     last_dt = upcoming[-1]["kdt"]
     period_disp = " · ".join([f"{sl} {_fmt_range(its)}" for _, sl, its, _ in labeled_buckets])
     cat_sig = "+".join([f"{fl}:{len(its)}" for fl, _, its, _ in labeled_buckets])
-    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v6"
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v7"
     today_str = now.strftime("%Y-%m-%d")
 
     # 이미 같은 일정·대회 구간(v6)으로 최근 1일 이내 생성된 총평이 AQ1에 있으면 API 호출 스킵
@@ -2326,11 +2329,14 @@ def run_round_briefing_sync() -> bool:
         for model_name in briefing_models:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+                rb_cfg = {"temperature": 0.25, "maxOutputTokens": 1500}
+                if "gemini-4" in model_name or "3.8" in model_name:
+                    rb_cfg["thinkingConfig"] = {"thinkingLevel": "low"}
                 payload = {
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.25, "maxOutputTokens": 700},
+                    "generationConfig": rb_cfg,
                 }
-                resp = requests.post(url, json=payload, timeout=25)
+                resp = requests.post(url, json=payload, timeout=35)
                 if resp.status_code == 200:
                     data = resp.json()
                     raw_txt = ""
