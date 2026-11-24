@@ -1426,22 +1426,22 @@ def _save_ai_issue_cache(cache_data: Dict[str, Any]) -> None:
 
 def _get_issue_stage(kdt: Optional[datetime], now: datetime) -> str:
     """
-    경기 시작 잔여 시간 기준 3단계 캐시 구간 반환:
-      - > 48h : "wait" (AI 검색 안 함 -> '경기 시작 2일 전부터 실시간 반영됩니다.')
-      - 24h ~ 48h : "48h" (2일 전 1회 검색)
-      - 5h ~ 24h  : "24h" (1일 전 1회 검색)
-      - <= 5h     : "5h"  (당일 5시간 전 최종 1회 검색; 1시간 전 공식 선발은 ESPN 무료 자동 합류)
+    경기 시작 잔여 시간 기준 3단계 자동 갱신 구간 반환:
+      - > 72h : "wait" (AI 검색 안 함 -> '경기 시작 3일 전부터 실시간 반영됩니다.')
+      - 24h ~ 72h : "72h" (3일 전 1차 검색)
+      - 5h ~ 24h  : "24h" (1일 전 2차 자동 갱신)
+      - <= 5h     : "5h"  (당일 5시간 전 3차 최종 자동 갱신; 1시간 전 공식 선발은 ESPN 무료 자동 합류)
     """
     if not kdt:
         return "24h"
     hrs = (kdt - now).total_seconds() / 3600.0
-    if hrs > 48.0:
+    if hrs > 72.0:
         return "wait"
     if hrs <= 5.0:
         return "5h"
     if hrs <= 24.0:
         return "24h"
-    return "48h"
+    return "72h"
 
 
 _EXHAUSTED_GEMINI_MODELS = set()
@@ -1546,6 +1546,10 @@ def _ask_gemini_grounded_match_issue(item: Dict[str, Any]) -> Tuple[str, str, bo
                 a_s = str(parsed.get("away", "")).replace("|", "·").replace("\n", " ").strip()
 
                 def _clean_grounded_line(txt: str, target_en: str, target_ko: str, other_en: str, other_ko: str) -> str:
+                    if not txt:
+                        return ""
+                    txt = re.sub(r'[\s"\',}]+$', '', str(txt).strip()).strip()
+                    txt = re.sub(r'^[\s"\']+', '', txt).strip()
                     if not txt or "실시간 반영됩니다" in txt or "확인된 이슈 없" in txt or "특이 사항 없" in txt:
                         return ""
                     if re.search(r"(예상 라인업 및 부상 최신|팀 뉴스 확인|부상 업데이트 확인)$", txt):
@@ -1872,16 +1876,37 @@ def run_team_issue_sync() -> int:
     ai_cache_dirty = False
     now_ts = time.time()
 
-    # 1단계: 2일(48시간) 초과 대기 처리 & 48시간 이내 경기 필터링
+    # 1단계: 3일(72시간) 초과 대기 처리 + 직전 경기 미종료 팀 보호 + 72시간 이내 경기 필터링
     active_items: List[Dict[str, Any]] = []
     grounding_todo: List[Dict[str, Any]] = []
     rss_fallback_rows: List[Dict[str, Any]] = []
     within_48h_rows = []
 
+    # 각 팀의 아직 끝나지 않은(킥오프 -2.5시간 이후) 경기 시간 목록을 미리 집계
+    unfinished_team_kickoffs: Dict[str, List[datetime]] = {}
+    for _, _, ht, at, _, _, u_kdt in upcoming_rows:
+        if u_kdt and (u_kdt - now).total_seconds() > -2.5 * 3600:
+            unfinished_team_kickoffs.setdefault(_norm_team(ht), []).append(u_kdt)
+            unfinished_team_kickoffs.setdefault(_norm_team(at), []).append(u_kdt)
+
+    def _has_earlier_unfinished(team_nm: str, target_kdt: Optional[datetime]) -> bool:
+        if not target_kdt:
+            return False
+        for pk in unfinished_team_kickoffs.get(_norm_team(team_nm), []):
+            if (target_kdt - pk).total_seconds() >= 6 * 3600:
+                return True
+        return False
+
     for idx, league, home_team, away_team, slug, curr_ap, kdt in upcoming_rows:
         hrs_to_ko = (kdt - now).total_seconds() / 3600.0 if kdt else 24.0
-        if kdt and hrs_to_ko > 48.0:
-            wait_msg = "경기 시작 2일 전부터 실시간 반영됩니다."
+        if kdt and hrs_to_ko > 72.0:
+            wait_msg = "경기 시작 3일 전부터 실시간 반영됩니다."
+            if curr_ap != wait_msg:
+                batch_updates.append({"range": f"AP{idx}", "values": [[wait_msg]]})
+                updated_issues += 1
+            continue
+        if kdt and hrs_to_ko > 12.0 and (_has_earlier_unfinished(home_team, kdt) or _has_earlier_unfinished(away_team, kdt)):
+            wait_msg = "직전 경기 종료 후 실시간 반영됩니다."
             if curr_ap != wait_msg:
                 batch_updates.append({"range": f"AP{idx}", "values": [[wait_msg]]})
                 updated_issues += 1
@@ -1891,7 +1916,7 @@ def run_team_issue_sync() -> int:
         within_48h_rows.append((idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko))
 
     use_grounding_now = bool(USE_GOOGLE_SEARCH_GROUNDING and GEMINI_API_KEY.strip() and not _GROUNDING_DISABLED)
-    print(f"▶ [팀 이슈 수집] 48시간 이내 대상 {len(within_48h_rows)}경기 점검 중... (모드: {'구글검색 그라운딩 3단계 캐시' if use_grounding_now else '무료 RSS 요약'})")
+    print(f"▶ [팀 이슈 수집] 72시간 이내 대상 {len(within_48h_rows)}경기 점검 중... (모드: {'구글검색 그라운딩 3단계 자동갱신' if use_grounding_now else '무료 RSS 요약'})")
 
     # 1-a: ESPN 무료 공식 라인업/부상 조회 + 단계별 캐시 확인 (48h / 24h / 5h)
     for idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko in within_48h_rows:
@@ -1947,11 +1972,11 @@ def run_team_issue_sync() -> int:
     # 2단계-A: 유료 구글 검색 그라운딩 병렬 실행 (신규/단계전환 경기만 1회 호출)
     batch_results: Dict[str, Tuple[str, str]] = {}
     if use_grounding_now and grounding_todo:
-        # 킥오프가 가장 임박한 경기부터 우선 처리하고, 1회 실행당 최대 15경기로 속도 조절 (RPM 429 폭주 방지)
+        # 킥오프가 가장 임박한 경기부터 우선 처리하고, 1회 실행당 최대 25경기로 속도 조절 (Tier 1 안전 범위)
         grounding_todo.sort(key=lambda x: x.get("hrs_to_ko", 999.0))
-        if len(grounding_todo) > 15:
-            print(f"▶ [그라운딩 검색] 미적중 {len(grounding_todo)}경기 중 임박 15경기 우선 실행 (나머지는 다음 30분 주기에 자동 이어서 처리)")
-            grounding_todo = grounding_todo[:15]
+        if len(grounding_todo) > 25:
+            print(f"▶ [그라운딩 검색] 미적중 {len(grounding_todo)}경기 중 임박 25경기 우선 실행 (나머지는 다음 30분 주기에 자동 이어서 처리)")
+            grounding_todo = grounding_todo[:25]
         else:
             print(f"▶ [그라운딩 검색] 캐시 미적중 {len(grounding_todo)}경기만 Gemini 검색 실행...")
         # 첫 경기로 그라운딩 키 권한 사전 확인 (무료 키면 즉시 RSS 폴백)
