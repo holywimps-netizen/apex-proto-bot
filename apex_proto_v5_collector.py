@@ -1426,21 +1426,24 @@ def _save_ai_issue_cache(cache_data: Dict[str, Any]) -> None:
 
 def _get_issue_stage(kdt: Optional[datetime], now: datetime) -> str:
     """
-    경기 시작 잔여 시간 기준 3단계 자동 갱신 구간 반환:
-      - > 72h : "wait" (AI 검색 안 함 -> '경기 시작 3일 전부터 실시간 반영됩니다.')
-      - 24h ~ 72h : "72h" (3일 전 1차 검색)
-      - 5h ~ 24h  : "24h" (1일 전 2차 자동 갱신)
-      - <= 5h     : "5h"  (당일 5시간 전 3차 최종 자동 갱신; 1시간 전 공식 선발은 ESPN 무료 자동 합류)
+    경기 시작 잔여 시간 기준 4단계 자동 갱신 구간 반환:
+      - > 72h     : "wait" (AI 검색 안 함 -> '경기 시작 3일 전부터 실시간 반영됩니다.')
+      - 48h ~ 72h : "72h" (3일 전 1차 검색)
+      - 24h ~ 48h : "48h" (2일 전 2차 자동 갱신)
+      - 5h ~ 24h  : "24h" (1일 전 3차 자동 갱신)
+      - <= 5h     : "5h"  (당일 5시간 전 4차 최종 자동 갱신; 1시간 전 공식 선발은 ESPN 무료 자동 합류)
     """
     if not kdt:
         return "24h"
     hrs = (kdt - now).total_seconds() / 3600.0
-    if hrs > 72.0:
+    if hrs > 65.0:
         return "wait"
     if hrs <= 5.0:
         return "5h"
     if hrs <= 24.0:
         return "24h"
+    if hrs <= 48.0:
+        return "48h"
     return "72h"
 
 
@@ -1902,7 +1905,7 @@ def run_team_issue_sync() -> int:
 
     for idx, league, home_team, away_team, slug, curr_ap, kdt in upcoming_rows:
         hrs_to_ko = (kdt - now).total_seconds() / 3600.0 if kdt else 24.0
-        if kdt and hrs_to_ko > 72.0:
+        if kdt and hrs_to_ko > 65.0:
             wait_msg = "경기 시작 3일 전부터 실시간 반영됩니다."
             if curr_ap != wait_msg:
                 batch_updates.append({"range": f"AP{idx}", "values": [[wait_msg]]})
@@ -1919,7 +1922,7 @@ def run_team_issue_sync() -> int:
         within_48h_rows.append((idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko))
 
     use_grounding_now = bool(USE_GOOGLE_SEARCH_GROUNDING and GEMINI_API_KEY.strip() and not _GROUNDING_DISABLED)
-    print(f"▶ [팀 이슈 수집] 72시간 이내 대상 {len(within_48h_rows)}경기 점검 중... (모드: {'구글검색 그라운딩 3단계 자동갱신' if use_grounding_now else '무료 RSS 요약'})")
+    print(f"▶ [팀 이슈 수집] 72시간 이내 대상 {len(within_48h_rows)}경기 점검 중... (모드: {'구글검색 그라운딩 4단계 자동갱신(72h/48h/24h/5h)' if use_grounding_now else '무료 RSS 요약'})")
 
     # 1-a: ESPN 무료 공식 라인업/부상 조회 + 단계별 캐시 확인 (48h / 24h / 5h)
     for idx, league, home_team, away_team, slug, curr_ap, kdt, hrs_to_ko in within_48h_rows:
@@ -1956,7 +1959,7 @@ def run_team_issue_sync() -> int:
         }
 
         if use_grounding_now:
-            # 이미 동일 단계(48h/24h/5h)에서 그라운딩 완료된 경기는 캐시 재사용 (중복 과금 0원!)
+            # 이미 동일 단계(72h/48h/24h/5h)에서 그라운딩 완료된 경기는 캐시 재사용 (중복 과금 0원!)
             has_stage_cache = (
                 isinstance(cached_entry, dict)
                 and cached_entry.get("ver") == "v6_grounding"
