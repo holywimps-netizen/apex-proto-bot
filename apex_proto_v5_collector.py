@@ -2208,12 +2208,25 @@ def run_round_briefing_sync() -> bool:
 
     all_upcoming.sort(key=lambda x: x["kdt"])
 
-    # 1) 현재 라운드 윈도우 필터: 향후 60시간(2.5일) 이내 경기 우선 선택 (다음 주말 경기가 주중 UCL 총평에 절대 섞이지 않도록 차단!)
+    # 1) 현재 라운드 윈도우 필터: 향후 60시간(2.5일) 이내 경기 우선 선택 + 같은 대회(리그·UCL·A매치·컵 공통)로 36시간 이내 연속 이어지는 잔여 경기까지 한 라운드로 묶기
     window_matches = [x for x in all_upcoming if x["hrs"] <= 60.0]
     if not window_matches:
-        # 60시간 내 경기가 없으면 가장 가까운 첫 경기 기준 +72시간 구간 선택
         anchor_hrs = all_upcoming[0]["hrs"]
         window_matches = [x for x in all_upcoming if x["hrs"] <= anchor_hrs + 72.0]
+
+    # 같은 대회 카테고리에서 직전 경기와 36시간 이내로 이어지는 잔여 경기 자동 합류 (타 대회나 48시간 이상 떨어진 다음 라운드는 차단)
+    last_dt_by_cat = {}
+    for x in window_matches:
+        last_dt_by_cat[x["cat"]] = x["kdt"]
+    for x in all_upcoming:
+        if x in window_matches:
+            continue
+        c = x["cat"]
+        if c in last_dt_by_cat and x["hrs"] <= 120.0:
+            gap_h = (x["kdt"] - last_dt_by_cat[c]).total_seconds() / 3600.0
+            if 0 <= gap_h <= 36.0:
+                window_matches.append(x)
+                last_dt_by_cat[c] = x["kdt"]
 
     upcoming = window_matches
     short_rest_cnt = sum(1 for x in upcoming if x["short_rest"])
@@ -2258,7 +2271,7 @@ def run_round_briefing_sync() -> bool:
     last_dt = upcoming[-1]["kdt"]
     period_disp = " · ".join([f"{sl} {_fmt_range(its)}" for _, sl, its, _ in labeled_buckets])
     cat_sig = "+".join([f"{fl}:{len(its)}" for fl, _, its, _ in labeled_buckets])
-    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v8"
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v9"
     today_str = now.strftime("%Y-%m-%d")
 
     # 이미 같은 일정·대회 구간(v6)으로 최근 1일 이내 생성된 총평이 AQ1에 있으면 API 호출 스킵
