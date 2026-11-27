@@ -1388,7 +1388,7 @@ def _build_quant_tactical_issue(
     h_rest_note = _team_rest_note(h_stats)
     a_rest_note = _team_rest_note(a_stats)
     empty_fallback = (
-        "경기 시작 2일 전부터 실시간 반영됩니다."
+        "경기 시작 3일 전부터 실시간 반영됩니다."
         if (hours_to_ko is not None and hours_to_ko > 24.0)
         else "공식 발표, 언론 보도 확인 시 실시간 반영됩니다."
     )
@@ -2190,7 +2190,7 @@ def run_round_briefing_sync() -> bool:
             continue
         hrs_diff = (kdt - now).total_seconds() / 3600.0
         cat = _classify_round_competition(lg)
-        if cat == "A매치" and -360 <= hrs_diff <= 0:
+        if cat == "A매치" and -120 <= hrs_diff <= 0:
             recent_amatch = True
         if hrs_diff >= -4.0:
             is_short = False
@@ -2258,7 +2258,7 @@ def run_round_briefing_sync() -> bool:
     last_dt = upcoming[-1]["kdt"]
     period_disp = " · ".join([f"{sl} {_fmt_range(its)}" for _, sl, its, _ in labeled_buckets])
     cat_sig = "+".join([f"{fl}:{len(its)}" for fl, _, its, _ in labeled_buckets])
-    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v7"
+    period_key = f"{first_dt.strftime('%Y-%m-%d')}~{last_dt.strftime('%Y-%m-%d')}|{cat_sig}#v8"
     today_str = now.strftime("%Y-%m-%d")
 
     # 이미 같은 일정·대회 구간(v6)으로 최근 1일 이내 생성된 총평이 AQ1에 있으면 API 호출 스킵
