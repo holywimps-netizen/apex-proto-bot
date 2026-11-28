@@ -2108,6 +2108,17 @@ def run_team_issue_sync() -> int:
         a_ext = item["a_ext"]
         ai_h, ai_a = batch_results.get(item["cache_key"], (item["ai_h"], item["ai_a"]))
 
+        def _clean_trailing_junk(txt: str) -> str:
+            if not txt:
+                return ""
+            # URL 태그 앞이나 문장 끝에 남은 JSON 찌꺼기(", 등) 정리
+            txt = re.sub(r'[\s"\',}]+(?=\s*\[URL:)', '', txt)
+            txt = re.sub(r'[\s"\',}]+$', '', txt).strip()
+            return txt
+
+        ai_h = _clean_trailing_junk(ai_h)
+        ai_a = _clean_trailing_junk(ai_a)
+
         if ai_h and "결장/부상:" not in h_ext:
             h_ext = f"{h_ext} / {ai_h}" if h_ext else ai_h
         if ai_a and "결장/부상:" not in a_ext:
@@ -2129,19 +2140,31 @@ def run_team_issue_sync() -> int:
         is_am = any(k in item["league"].lower() for k in ("nations", "world cup", "qual", "euro", "asian", "copa", "friendly", "international"))
         h_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["home"], item["kdt"], club_history_issues)
         a_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["away"], item["kdt"], club_history_issues)
-        # 기존 시트에 이미 수집된 부상·징계 브리핑이 있다면, 공식 선발확정이 들어와도 절대 지우지 말고 뒤에 이어 붙임!
+
+        # 기존 시트에 이미 수집된 부상·징계 브리핑이 있다면, 공식 선발확정만 단독으로 들어올 때 지우지 말고 뒤에 이어 붙임 (중복 결합 차단!)
+        def _has_non_lineup_issue(txt: str) -> bool:
+            if not txt:
+                return False
+            parts = [p.strip() for p in txt.split(" / ") if p.strip()]
+            return any("선발확정:" not in p and "단기 휴식(" not in p and _has_real_issue_text(p) for p in parts)
+
         prev_h, prev_a = _split_existing_ap(item["curr_ap"])
-        if prev_h and "선발확정:" in h_ext and "선발확정:" not in prev_h:
-            prev_h_clean = re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_h).strip()
+        prev_h = _clean_trailing_junk(prev_h)
+        prev_a = _clean_trailing_junk(prev_a)
+        h_ext = _clean_trailing_junk(h_ext)
+        a_ext = _clean_trailing_junk(a_ext)
+
+        if prev_h and "선발확정:" in h_ext and "선발확정:" not in prev_h and not _has_non_lineup_issue(h_ext):
+            prev_h_clean = _clean_trailing_junk(re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_h).strip())
             if prev_h_clean and prev_h_clean not in h_ext:
-                h_ext = f"{prev_h_clean} / {h_ext}"
+                h_ext = f"{h_ext} / {prev_h_clean}"
         elif not _has_real_issue_text(h_ext) and prev_h:
             h_ext = prev_h
 
-        if prev_a and "선발확정:" in a_ext and "선발확정:" not in prev_a:
-            prev_a_clean = re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_a).strip()
+        if prev_a and "선발확정:" in a_ext and "선발확정:" not in prev_a and not _has_non_lineup_issue(a_ext):
+            prev_a_clean = _clean_trailing_junk(re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_a).strip())
             if prev_a_clean and prev_a_clean not in a_ext:
-                a_ext = f"{prev_a_clean} / {a_ext}"
+                a_ext = f"{a_ext} / {prev_a_clean}"
         elif not _has_real_issue_text(a_ext) and prev_a:
             a_ext = prev_a
 
