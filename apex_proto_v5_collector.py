@@ -2127,11 +2127,20 @@ def run_team_issue_sync() -> int:
         is_am = any(k in item["league"].lower() for k in ("nations", "world cup", "qual", "euro", "asian", "copa", "friendly", "international"))
         h_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["home"], item["kdt"], club_history_issues)
         a_stats["rest_hours"] = 96.0 if is_am else _calc_club_rest_hours(item["away"], item["kdt"], club_history_issues)
-        # 기존 시트에 이미 수집된 유효 브리핑이 있다면, 이번 회차 빈 응답으로 절대 덮어쓰지 않고 보존!
+        # 기존 시트에 이미 수집된 부상·징계 브리핑이 있다면, 공식 선발확정이 들어와도 절대 지우지 말고 뒤에 이어 붙임!
         prev_h, prev_a = _split_existing_ap(item["curr_ap"])
-        if not _has_real_issue_text(h_ext) and prev_h:
+        if prev_h and "선발확정:" in h_ext and "선발확정:" not in prev_h:
+            prev_h_clean = re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_h).strip()
+            if prev_h_clean and prev_h_clean not in h_ext:
+                h_ext = f"{prev_h_clean} / {h_ext}"
+        elif not _has_real_issue_text(h_ext) and prev_h:
             h_ext = prev_h
-        if not _has_real_issue_text(a_ext) and prev_a:
+
+        if prev_a and "선발확정:" in a_ext and "선발확정:" not in prev_a:
+            prev_a_clean = re.sub(r"\s*/\s*⚠️단기 휴식\([^)]*\)", "", prev_a).strip()
+            if prev_a_clean and prev_a_clean not in a_ext:
+                a_ext = f"{prev_a_clean} / {a_ext}"
+        elif not _has_real_issue_text(a_ext) and prev_a:
             a_ext = prev_a
 
         issue_text = _build_quant_tactical_issue(
