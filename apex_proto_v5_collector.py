@@ -538,35 +538,50 @@ def _build_club_schedule_history(all_values: List[List[str]]) -> Dict[str, List[
             _add_dt(r[3].strip(), kdt)
             _add_dt(r[4].strip(), kdt)
 
-    # 2) ESPN 최근 10일 유럽 5대리그 + UCL 일정 수집
-    club_slugs = ("eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "uefa.champions")
+    # 2) ESPN 최근 10일 유럽 5대리그 + UCL + 유로파리그(UEL) + 컨퍼런스리그(UECL) + 5대 국내 컵대회 일정 병렬 수집
+    club_slugs = (
+        "eng.1", "esp.1", "ger.1", "ita.1", "fra.1",
+        "uefa.champions", "uefa.europa", "uefa.europa.conf",
+        "eng.fa", "eng.league_cup", "esp.copa_del_rey", "ger.dfb_pokal", "ita.coppa_italia", "fra.coupe_de_france",
+    )
     now_dt = _now_kst()
-    for d_off in range(0, 11):
-        d_str = (now_dt - timedelta(days=d_off)).strftime("%Y%m%d")
-        for slug in club_slugs:
-            url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={d_str}"
-            try:
-                resp = requests.get(url, timeout=4)
-                if resp.status_code != 200:
+    tasks = [
+        (slug, (now_dt - timedelta(days=d_off)).strftime("%Y%m%d"))
+        for d_off in range(0, 10)
+        for slug in club_slugs
+    ]
+
+    def _fetch_espn_day(pair):
+        slug, d_str = pair
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={d_str}"
+        found = []
+        try:
+            resp = requests.get(url, timeout=4)
+            if resp.status_code != 200:
+                return found
+            for ev in resp.json().get("events", []):
+                ev_date = ev.get("date", "")
+                comps = ev.get("competitions", [])
+                if not ev_date or not comps:
                     continue
-                for ev in resp.json().get("events", []):
-                    ev_date = ev.get("date", "")
-                    comps = ev.get("competitions", [])
-                    if not ev_date or not comps:
-                        continue
-                    try:
-                        # ESPN UTC ISO -> KST(+9h)
-                        utc_dt = datetime.fromisoformat(ev_date.replace("Z", "+00:00"))
-                        kst_dt = (utc_dt + timedelta(hours=9)).replace(tzinfo=None)
-                    except Exception:
-                        continue
-                    for c in comps[0].get("competitors", []):
-                        t_info = c.get("team", {})
-                        for cand in (t_info.get("displayName", ""), t_info.get("shortDisplayName", ""), t_info.get("name", "")):
-                            if cand:
-                                _add_dt(cand, kst_dt)
-            except Exception:
-                continue
+                try:
+                    utc_dt = datetime.fromisoformat(ev_date.replace("Z", "+00:00"))
+                    kst_dt = (utc_dt + timedelta(hours=9)).replace(tzinfo=None)
+                except Exception:
+                    continue
+                for c in comps[0].get("competitors", []):
+                    t_info = c.get("team", {})
+                    for cand in (t_info.get("displayName", ""), t_info.get("shortDisplayName", ""), t_info.get("name", "")):
+                        if cand:
+                            found.append((cand, kst_dt))
+        except Exception:
+            pass
+        return found
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for res_list in pool.map(_fetch_espn_day, tasks):
+            for cand, kst_dt in res_list:
+                _add_dt(cand, kst_dt)
 
     for k in history:
         history[k] = sorted(set(history[k]))
@@ -1611,8 +1626,8 @@ def _ask_gemini_grounded_match_issue(item: Dict[str, Any]) -> Tuple[str, str, bo
                             m_json = re.search(r"\{.*\}", raw_txt, re.S)
                             if m_json:
                                 parsed = json.loads(m_json.group(0))
-                                h_s = str(parsed.get("home", "")).replace("|", "·").replace("\n", " ").strip()
-                                a_s = str(parsed.get("away", "")).replace("|", "·").replace("\n", " ").strip()
+                                h_s = re.sub(r'[\s"\',}]+$', '', str(parsed.get("home", "")).replace("|", "·").replace("\n", " ").strip()).strip()
+                                a_s = re.sub(r'[\s"\',}]+$', '', str(parsed.get("away", "")).replace("|", "·").replace("\n", " ").strip()).strip()
                                 if h_s and "[URL:" not in h_s:
                                     hu = _pick_team_grounding_url(g_urls, home_en, h_ko)
                                     if hu:
